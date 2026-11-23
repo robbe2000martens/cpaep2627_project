@@ -35,4 +35,6 @@ Some long log of the previous tests.
 #    Time: 410816 ns  Iteration: 0  Instance: /tb_one_mac_gemm
 # End time: 10:12:59 on Nov 27,2025, Elapsed time: 0:00:01
 # Errors: 0, Warnings: 3
+
+#new test line
 ```
