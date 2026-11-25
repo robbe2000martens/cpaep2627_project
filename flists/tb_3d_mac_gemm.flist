@@ -6,4 +6,4 @@ rtl/gemm/gemm_controller.sv
 rtl/gemm/gemm_accelerator_top.sv
 
 rtl/common/single_port_memory.sv
-tb/tb_two_mac_gemm.sv
+tb/tb_3d_mac_gemm.sv

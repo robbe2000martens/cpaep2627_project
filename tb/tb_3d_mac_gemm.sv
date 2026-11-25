@@ -1,4 +1,4 @@
-module tb_two_mac_gemm;
+module tb_3d_mac_gemm;
   //---------------------------
   // Design Time Parameters
   //---------------------------
