@@ -3,35 +3,41 @@ module tb_3d_mac_gemm;
   // Design Time Parameters
   //---------------------------
 
-  //---------------------------
-  // DESIGN NOTE:
-  // Parameters are a way to customize your design at
-  // compile time. Here we define the data width,
-  // memory depth, and number of ports for the
-  // multi-port memory instances used in the DUT.
-  //
-  // In other test benches, you can also have test parameters,
-  // such as the number of tests to run, or the sizes of
-  // matrices to be used in the tests.
-  //
-  // You can customize these parameters as needed.
-  // Or you can also add your own parameters.
-  //---------------------------
-
-  // General Parameters
+  // Matrices in the testbench (golden model, packing): large enough for
+  // the biggest operand, A of GeMV 3 = 2816 x 2048 elements
   parameter int unsigned InDataWidth   = 8;
   parameter int unsigned OutDataWidth  = 32;
-  parameter int unsigned DataDepth     = 8192;
+  parameter int unsigned DataDepth     = 6000000;
   parameter int unsigned AddrWidth     = (DataDepth <= 1) ? 1 : $clog2(DataDepth);
-  parameter int unsigned SizeAddrWidth = 8;
+  parameter int unsigned SizeAddrWidth = 12;     // sizes up to 4095
+
+  // The MAC array: H x W x D
+  parameter int unsigned ArrayHeight   = 64;     // H, PE rows    (m)
+  parameter int unsigned ArrayWidth    = 8;      // W, PE columns (n)
+  parameter int unsigned ArrayDepth    = 1;      // D, MACs per PE (k)
+
+  // SRAM ports: 1024 bits cumulative
+  parameter int unsigned APortWidth    = InDataWidth * ArrayHeight * ArrayDepth;
+  parameter int unsigned BPortWidth    = InDataWidth * ArrayWidth  * ArrayDepth;
+  parameter int unsigned CPortWidth    = ((1024 - APortWidth - BPortWidth) / OutDataWidth) * OutDataWidth;
+  localparam int unsigned CLanes       = CPortWidth / OutDataWidth;
+
+  initial begin
+    if (APortWidth + BPortWidth + CPortWidth > 1024)
+      $fatal(1, "SRAM ports use %0d bits, budget is 1024",
+             APortWidth + BPortWidth + CPortWidth);
+    if (ArrayHeight * ArrayWidth * ArrayDepth > 512)
+      $fatal(1, "%0d MACs, budget is 512", ArrayHeight * ArrayWidth * ArrayDepth);
+  end
 
   //---------------------------
   // Test cases
   //---------------------------
   // GeMM: C (M x N) = A (M x K) * B (K x N)
   // GeMV: y (M x 1) = A (M x K) * x (K x 1), which is a GeMM with N = 1
-  //
-  // To add a case, add a line below and bump NumCases.
+  // The small cases first: they hit the corners of the tiling
+  // (one k-step, partial row and column tiles, a single element).
+  // DESIGN NOTE: the target workloads are the last six lines.
   //---------------------------
   typedef struct {
     string       name;
@@ -42,28 +48,14 @@ module tb_3d_mac_gemm;
 
   localparam int unsigned NumCases = 6;
 
-  //---------------------------
-  // DESIGN NOTE:
-  // Here we define the test_cases, but we give simple test cases first
-  // So you can explore and see how it can be used
-  // Replace these test cases with the target workloads in the document
-  //---------------------------
   test_case_t test_cases [NumCases] = '{
-    //  name       M   K   N
-   '{"GeMM 1",   4, 64, 16},
-   '{"GeMM 2",  16, 64,  4},
-   '{"GeMM 3",  32, 32, 32},
-   '{"GeMV 1",  32, 32,  1},
-   '{"GeMV 2",  64, 32,  1},
-   '{"GeMV 3",  64, 64,  1}
-    //DESIGN NOTE:
-    // Target workloads for the test cases uncomment for later
-    // {"GeMM WL1",   64, 64, 32},
-    // {"GeMM WL2",   64, 128, 32},
-    // {"GeMM WL3",   64, 576, 32},
-    // {"GeMV WL1",   1536, 576, 1},
-    // {"GeMV WL2",   3072, 1024, 1},
-    // {"GeMV WL3",   2816, 2048, 1}
+    //  name        M     K     N
+    '{"GeMM 1",    64,   64,   32},
+    '{"GeMM 2",    64,  128,   32},
+    '{"GeMM 3",    64,  576,   32},
+    '{"GeMV 1",  1536,  576,    1},
+    '{"GeMV 2",  3072, 1024,    1},
+    '{"GeMV 3",  2816, 2048,    1}
   };
 
   // Per-case results, printed in the summary at the end
@@ -74,22 +66,19 @@ module tb_3d_mac_gemm;
   //---------------------------
   // Wires
   //---------------------------
+  logic [SizeAddrWidth-1:0] M_i, K_i, N_i;   // sizes in elements
 
-  // Size control
-  logic [SizeAddrWidth-1:0] M_i, K_i, N_i;
-
-  // Clock, reset, and other signals
   logic clk_i;
   logic rst_ni;
   logic start;
   logic done;
   logic [AddrWidth-1:0] test_depth;
 
-  //---------------------------
-  // Memory
-  //---------------------------
-  // Golden data dump
+  // Golden result and the plain row-major matrices
   logic signed [OutDataWidth-1:0] G_memory [DataDepth];
+  logic signed [ InDataWidth-1:0] A_matrix [DataDepth];
+  logic signed [ InDataWidth-1:0] B_matrix [DataDepth];
+  logic signed [OutDataWidth-1:0] C_matrix [DataDepth];
 
   // Memory control
   logic [AddrWidth-1:0] sram_a_addr;
@@ -99,95 +88,77 @@ module tb_3d_mac_gemm;
   logic                 sram_b_re;
 
   // Memory access
-  logic signed [ InDataWidth-1:0] sram_a_rdata;
-  logic signed [ InDataWidth-1:0] sram_b_rdata;
-  logic signed [OutDataWidth-1:0] sram_c_wdata;
-  logic                           sram_c_we;
+  logic signed [APortWidth-1:0] sram_a_rdata;
+  logic signed [BPortWidth-1:0] sram_b_rdata;
+  logic signed [CPortWidth-1:0] sram_c_wdata;
+  logic                         sram_c_we;
 
   //---------------------------
-  // Declaration of input and output memories
+  // Memories: one single_port_memory per port, only the word width changed
   //---------------------------
-
-  //---------------------------
-  // DESIGN NOTE:
-  // These are where the memories are instantiated for the DUT.
-  // You can modify the data width and data depth parameters.
-  //
-  // This can be useful for increasing your memory bandwidth.
-  // However, you need to think about and take care of how to,
-  // initialize the memories accordingly.
-  // That includes knowing how to pack the data accordingly.
-  //
-  // Make sure that the connection for the address, data, and wen
-  // signals are consistent with the number of ports.
-  //
-  // Refer to the single_port_memory.sv and 
-  // tb_single_port_memory.sv file for more details.
-  //---------------------------
-
-  // Input memory A
-  // Note: this is read only
   single_port_memory #(
-    .DataWidth     ( InDataWidth  ),
-    .DataDepth     ( DataDepth    ),
-    .AddrWidth     ( AddrWidth    )
+    .DataWidth     ( APortWidth    ),
+    .DataDepth     ( DataDepth     ),
+    .AddrWidth     ( AddrWidth     )
   ) i_sram_a (
-    .clk_i         ( clk_i        ),
-    .rst_ni        ( rst_ni       ),
-    .mem_addr_i    ( sram_a_addr  ),
-    .mem_re_i      ( sram_a_re    ),
-    .mem_we_i      ( '0           ),
-    .mem_wr_data_i ( '0           ),
-    .mem_rd_data_o ( sram_a_rdata )
+    .clk_i         ( clk_i         ),
+    .rst_ni        ( rst_ni        ),
+    .mem_addr_i    ( sram_a_addr   ),
+    .mem_re_i      ( sram_a_re     ),
+    .mem_we_i      ( '0            ),
+    .mem_wr_data_i ( '0            ),
+    .mem_rd_data_o ( sram_a_rdata  )
   );
 
-  // Input memory B
-  // Note: this is read only
   single_port_memory #(
-    .DataWidth     ( InDataWidth  ),
-    .DataDepth     ( DataDepth    ),
-    .AddrWidth     ( AddrWidth    )
+    .DataWidth     ( BPortWidth    ),
+    .DataDepth     ( DataDepth     ),
+    .AddrWidth     ( AddrWidth     )
   ) i_sram_b (
-    .clk_i         ( clk_i        ),
-    .rst_ni        ( rst_ni       ),
-    .mem_addr_i    ( sram_b_addr  ),
-    .mem_re_i      ( sram_b_re    ),
-    .mem_we_i      ( '0           ),
-    .mem_wr_data_i ( '0           ),
-    .mem_rd_data_o ( sram_b_rdata )
+    .clk_i         ( clk_i         ),
+    .rst_ni        ( rst_ni        ),
+    .mem_addr_i    ( sram_b_addr   ),
+    .mem_re_i      ( sram_b_re     ),
+    .mem_we_i      ( '0            ),
+    .mem_wr_data_i ( '0            ),
+    .mem_rd_data_o ( sram_b_rdata  )
   );
 
-  // Output memory C
-  // Note: this is write only
   single_port_memory #(
-    .DataWidth     ( OutDataWidth ),
-    .DataDepth     ( DataDepth    ),
-    .AddrWidth     ( AddrWidth    )
+    .DataWidth     ( CPortWidth    ),
+    .DataDepth     ( DataDepth     ),
+    .AddrWidth     ( AddrWidth     )
   ) i_sram_c (
-    .clk_i         ( clk_i        ),
-    .rst_ni        ( rst_ni       ),
-    .mem_addr_i    ( sram_c_addr  ),
-    .mem_re_i      ( '0           ),
-    .mem_we_i      ( sram_c_we    ),
-    .mem_wr_data_i ( sram_c_wdata ),
-    .mem_rd_data_o ( /* unused */ )
+    .clk_i         ( clk_i         ),
+    .rst_ni        ( rst_ni        ),
+    .mem_addr_i    ( sram_c_addr   ),
+    .mem_re_i      ( '0            ),
+    .mem_we_i      ( sram_c_we     ),
+    .mem_wr_data_i ( sram_c_wdata  ),
+    .mem_rd_data_o ( /* unused */  )
   );
 
   //---------------------------
-  // DUT instantiation
+  // DUT
   //---------------------------
-  gemm_accelerator_top #(
+  gemm_accelerator_new_top #(
     .InDataWidth   ( InDataWidth   ),
     .OutDataWidth  ( OutDataWidth  ),
     .AddrWidth     ( AddrWidth     ),
-    .SizeAddrWidth ( SizeAddrWidth )
+    .SizeAddrWidth ( SizeAddrWidth ),
+    .ArrayHeight   ( ArrayHeight   ),
+    .ArrayWidth    ( ArrayWidth    ),
+    .ArrayDepth    ( ArrayDepth    ),
+    .APortWidth    ( APortWidth    ),
+    .BPortWidth    ( BPortWidth    ),
+    .CPortWidth    ( CPortWidth    )
   ) i_dut (
     .clk_i          ( clk_i        ),
     .rst_ni         ( rst_ni       ),
     .start_i        ( start        ),
-    .N_size_i       ( N_i          ),
     .M_size_i       ( M_i          ),
     .K_size_i       ( K_i          ),
+    .N_size_i       ( N_i          ),
     .sram_a_addr_o  ( sram_a_addr  ),
     .sram_b_addr_o  ( sram_b_addr  ),
     .sram_c_addr_o  ( sram_c_addr  ),
@@ -207,50 +178,99 @@ module tb_3d_mac_gemm;
   `include "includes/test_tasks.svh"
   `include "includes/test_func.svh"
 
-  // Metrics variables live in metrics_pkg (rtl/common/metrics_pkg.sv):
-  // - metrics_pkg::area   starts at 0, each module adds its area at time 0
-  // - metrics_pkg::energy is reset right before each case starts and read
-  //                       right after it is done, so it holds one case only
+  function automatic int unsigned ceil_div(input int unsigned a, input int unsigned b);
+    return (a + b - 1) / b;
+  endfunction
+
+  //---------------------------
+  // Packing: the layout must match gemm_accelerator_top.sv
+  //   SRAM A word mt*Kt + kt : A(mt*H + m, kt*D + k) at bits [(m*D + k)*8 +: 8]
+  //   SRAM B word nt*Kt + kt : B(kt*D + k, nt*W + n) at bits [(k*W + n)*8 +: 8]
+  // Elements outside the matrix are zero (padding).
+  //---------------------------
+  task automatic pack_inputs(input int unsigned M, input int unsigned K, input int unsigned N);
+    logic [APortWidth-1:0] a_word;
+    logic [BPortWidth-1:0] b_word;
+    int unsigned Mt, Kt, Nt, row, col;
+
+    Mt = ceil_div(M, ArrayHeight);
+    Kt = ceil_div(K, ArrayDepth);
+    Nt = ceil_div(N, ArrayWidth);
+
+    for (int unsigned mt = 0; mt < Mt; mt++) begin
+      for (int unsigned kt = 0; kt < Kt; kt++) begin
+        a_word = '0;
+        for (int unsigned m = 0; m < ArrayHeight; m++) begin
+          for (int unsigned k = 0; k < ArrayDepth; k++) begin
+            row = mt*ArrayHeight + m;
+            col = kt*ArrayDepth  + k;
+            if (row < M && col < K)
+              a_word[(m*ArrayDepth + k)*InDataWidth +: InDataWidth] = A_matrix[row*K + col];
+          end
+        end
+        i_sram_a.memory[mt*Kt + kt] = a_word;
+      end
+    end
+
+    for (int unsigned nt = 0; nt < Nt; nt++) begin
+      for (int unsigned kt = 0; kt < Kt; kt++) begin
+        b_word = '0;
+        for (int unsigned k = 0; k < ArrayDepth; k++) begin
+          for (int unsigned n = 0; n < ArrayWidth; n++) begin
+            row = kt*ArrayDepth + k;
+            col = nt*ArrayWidth + n;
+            if (row < K && col < N)
+              b_word[(k*ArrayWidth + n)*InDataWidth +: InDataWidth] = B_matrix[row*N + col];
+          end
+        end
+        i_sram_b.memory[nt*Kt + kt] = b_word;
+      end
+    end
+  endtask
+
+  //---------------------------
+  // Unpacking: SRAM C holds the drained tiles back to back, in loop order
+  // (mt outer, nt inner). Tile output p = n*H + m (column-major) is in
+  // word p / CLanes of the tile, lane p % CLanes. Only the n_valid
+  // columns of a tile are drained: G = ceil(H*n_valid / CLanes) words.
+  //---------------------------
+  task automatic unpack_output(input int unsigned M, input int unsigned N);
+    logic [CPortWidth-1:0] c_word;
+    int unsigned Mt, Nt, ptr, n_valid, groups, p, m, n, row, col;
+
+    Mt  = ceil_div(M, ArrayHeight);
+    Nt  = ceil_div(N, ArrayWidth);
+    ptr = 0;
+    for (int unsigned mt = 0; mt < Mt; mt++) begin
+      for (int unsigned nt = 0; nt < Nt; nt++) begin
+        n_valid = (N - nt*ArrayWidth < ArrayWidth) ? N - nt*ArrayWidth : ArrayWidth;
+        groups  = ceil_div(ArrayHeight * n_valid, CLanes);
+        for (int unsigned g = 0; g < groups; g++) begin
+          c_word = i_sram_c.memory[ptr];
+          ptr++;
+          for (int unsigned l = 0; l < CLanes; l++) begin
+            p   = g*CLanes + l;
+            n   = p / ArrayHeight;
+            m   = p % ArrayHeight;
+            row = mt*ArrayHeight + m;
+            col = nt*ArrayWidth  + n;
+            if (n < n_valid && row < M)
+              C_matrix[row*N + col] = c_word[l*OutDataWidth +: OutDataWidth];
+          end
+        end
+      end
+    end
+  endtask
 
   //---------------------------
   // Test control
   //---------------------------
-
-  // Clock generation
   initial begin
     clk_i = 1'b0;
     forever #5 clk_i = ~clk_i;  // 100MHz clock
   end
 
-  //---------------------------
-  // DESIGN NOTE:
-  //
-  // The sequence driver is usually the main stimulus
-  // generator for the test bench. Here is where
-  // you define the sequence of operations to be
-  // performed during the simulation.
-  //
-  // It often starts with an initial reset sequence,
-  // by loading default values and asserting the reset.
-  //
-  // We also do for-loops to run multiple tests
-  // with different input parameters. In this case,
-  // we loop over the fixed GeMM and GeMV sizes
-  // listed in test_cases at the top of this file.
-  //
-  // You can also customize in here the way
-  // the memories are initialized, how the golden
-  // results are generated, and how the results
-  // are verified.
-  //
-  // Refer to the tasks and functions included above
-  // for more details.
-  //---------------------------
-
-  // Sequence driver
   initial begin
-
-    // Initial reset
     start  = 1'b0;
     M_i    = '0;
     K_i    = '0;
@@ -259,6 +279,7 @@ module tb_3d_mac_gemm;
     #50;
     rst_ni = 1'b1;
 
+    // All cases in one simulation, without resetting the DUT in between
     foreach (test_cases[c]) begin
       M_i = test_cases[c].M;
       K_i = test_cases[c].K;
@@ -267,73 +288,30 @@ module tb_3d_mac_gemm;
       $display("[%0s] A (%0d x %0d) * B (%0d x %0d) -> C (%0d x %0d)",
                test_cases[c].name, M_i, K_i, K_i, N_i, M_i, N_i);
 
-      //---------------------------
-      // DESIGN NOTE:
-      // You will most likely modify this part
-      // to initialize the input memories
-      // according to your design requirements.
-      //
-      // In here, we simply fill the memories
-      // with random data for testing.
-      //
-      // We assume a row-major storage for both matrices A and B.
-      // Row major means that the elements of each row
-      // are stored in contiguous memory locations.
-      //
-      // We also make the assumption that the matrix output C
-      // will be stored in row-major format as well.
-      //
-      // Take note that you WILL change this part according to your design.
-      // Just make sure that the way you initialize the memories
-      // is consistent with the way you generate the golden results
-      // and the way your DUT reads/writes the data.
-      //
-      // The tricky part here is that since the data accesses are
-      // shared within a single long bit-width (suppose you use longer)
-      // memory word. For example, if your memory word is 32 bits wide
-      // and your data width is 8 bits, then you can pack
-      // 4 data elements in a single memory word.
-      // So when you initialize the memory, you need to
-      // make sure that the data elements are packed
-      // correctly within each memory word.
-      //---------------------------
+      // Random row-major matrices
+      for (integer i = 0; i < M_i*K_i; i++) A_matrix[i] = $urandom() % (2 ** InDataWidth);
+      for (integer i = 0; i < K_i*N_i; i++) B_matrix[i] = $urandom() % (2 ** InDataWidth);
 
-      // Initialize memories with random data
-      for (integer m = 0; m < M_i; m++) begin
-        for (integer k = 0; k < K_i; k++) begin
-          i_sram_a.memory[m*K_i+k] = $urandom() % (2 ** InDataWidth);
-        end
-      end
+      // Pack them into the SRAM words; poison SRAM C so a missing write fails
+      pack_inputs(M_i, K_i, N_i);
+      for (integer i = 0; i < DataDepth; i++) i_sram_c.memory[i] = 'x;
+      for (integer i = 0; i < M_i*N_i; i++) C_matrix[i] = 'x;
 
-      for (integer k = 0; k < K_i; k++) begin
-        for (integer n = 0; n < N_i; n++) begin
-          i_sram_b.memory[k*N_i+n] = $urandom() % (2 ** InDataWidth);
-        end
-      end
+      gemm_golden(M_i, K_i, N_i, A_matrix, B_matrix, G_memory);
 
-      // Generate golden result
-      gemm_golden(M_i, K_i, N_i, i_sram_a.memory, i_sram_b.memory, G_memory);
-
-      // Just delay 1 cycle
       clk_delay(1);
 
-      // Count energy for this case only: from start until done
       metrics_pkg::energy = 0;
       start_and_wait_gemm(case_cycles[c]);
       case_energy[c] = metrics_pkg::energy;
 
-      // Verify the result
+      unpack_output(M_i, N_i);
       test_depth = M_i * N_i;
-      verify_result_c(G_memory, i_sram_c.memory, test_depth,
-                      0, // Set this to 1 to make mismatches fatal
-                      case_errors[c]);
+      verify_result_c(G_memory, C_matrix, test_depth, 0, case_errors[c]);
 
       $display("[%0s] %0s: %0d cycles, %0.0f energy units\n",
                test_cases[c].name, (case_errors[c] == 0) ? "PASS" : "FAIL",
                case_cycles[c], case_energy[c]);
-
-      // Just some trailing cycles
-      // For easier monitoring in waveform
       clk_delay(10);
     end
 
@@ -344,8 +322,6 @@ module tb_3d_mac_gemm;
   //---------------------------
   // Final report
   //---------------------------
-  // Left-align a string to a fixed width
-  // (avoids %-Ns, which some simulators format differently)
   function automatic string pad(string str, int unsigned width);
     while (str.len() < width) str = {str, " "};
     return str;
@@ -356,7 +332,8 @@ module tb_3d_mac_gemm;
 
     $display("");
     $display("==================================================================");
-    $display(" RESULTS");
+    $display(" RESULTS  (array %0dx%0dx%0d, ports A %0d + B %0d + C %0d bits)",
+             ArrayHeight, ArrayWidth, ArrayDepth, APortWidth, BPortWidth, CPortWidth);
     $display("------------------------------------------------------------------");
     $display(" %s | %4s %4s %4s | %8s | %12s | %s",
              pad("Case", 8), "M", "K", "N", "Cycles", "Energy", "Check");
