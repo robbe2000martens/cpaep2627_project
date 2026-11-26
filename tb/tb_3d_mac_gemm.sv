@@ -18,8 +18,9 @@ module tb_3d_mac_gemm;
 
   // SRAM ports: 1024 bits cumulative
   // An A word holds 96 rows of int8: a GeMM uses the first H = 64 (one per
-  // PE row), a GeMV all 96 (rows of y: PE column 0 plus the top 32 PEs of
-  // column 1). The word is split over two SRAM banks with the same address,
+  // PE row), a GeMV all 96 (rows of y, in one of two PE banks: PE column 0
+  // plus the top 32 PEs of column 1, or the bottom 32 PEs of column 1 plus
+  // column 2). The word is split over two SRAM banks with the same address,
   // A_lo = rows 0..63 (512 bits) and A_hi = rows 64..95 (256 bits), so a
   // GeMM only reads A_lo. C gets the rest: 192 bits = 6 int32 per word.
   parameter int unsigned APortWidth    = 768;
@@ -27,6 +28,7 @@ module tb_3d_mac_gemm;
   parameter int unsigned CPortWidth    = ((1024 - APortWidth - BPortWidth) / OutDataWidth) * OutDataWidth;
   localparam int unsigned CLanes       = CPortWidth / OutDataWidth;
   localparam int unsigned GemvRows     = APortWidth / (InDataWidth * ArrayDepth);  // rows of y per GeMV tile
+  localparam int unsigned GemvWords    = (GemvRows + CLanes - 1) / CLanes;         // C words of a full GeMV tile
   localparam int unsigned ALoWidth     = InDataWidth * ArrayDepth * ArrayHeight;   // SRAM A_lo word
   localparam int unsigned AHiWidth     = APortWidth - ALoWidth;                    // SRAM A_hi word
 
@@ -48,9 +50,17 @@ module tb_3d_mac_gemm;
   //---------------------------
   // GeMM: C (M x N) = A (M x K) * B (K x N)
   // GeMV: y (M x 1) = A (M x K) * x (K x 1), which is a GeMM with N = 1
-  // The small cases first: they hit the corners of the tiling
-  // (one k-step, partial row and column tiles, a single element).
-  // DESIGN NOTE: the target workloads are the last six lines.
+  // DESIGN NOTE: the target workloads are the first six lines. They run
+  // first, so their random matrices (and energies) do not depend on the
+  // small cases after them. Those hit the corners of the tiling and of
+  // the GeMV tile overlap, where a tile drains (up to GemvWords = 16
+  // words) while the next one is read, if Kt > GemvWords:
+  //   Edge 1: overlap with the least slack, Kt = GemvWords + 1; 3 tiles,
+  //           so PE bank 0 is used again; a last tile of 8 rows
+  //   Edge 2: overlap; the last tile (H + 6 rows, reads A_hi) in bank 1
+  //   Edge 3: Kt = GemvWords: no overlap, the tiles run one by one
+  //   Edge 4: a GeMV with one k-step; a last tile of one row
+  //   Edge 5: a GeMM with one k-step; partial row and column tiles
   //---------------------------
   typedef struct {
     string       name;
@@ -59,16 +69,16 @@ module tb_3d_mac_gemm;
     int unsigned N;
   } test_case_t;
 
-  localparam int unsigned NumCases = 6;
+  localparam int unsigned NumCases   = 6;
 
   test_case_t test_cases [NumCases] = '{
-    //  name        M     K     N
-    '{"GeMM 1",    64,   64,   32},
-    '{"GeMM 2",    64,  128,   32},
-    '{"GeMM 3",    64,  576,   32},
-    '{"GeMV 1",  1536,  576,    1},
-    '{"GeMV 2",  3072, 1024,    1},
-    '{"GeMV 3",  2816, 2048,    1}
+    //  name        M   K   N
+    {"GeMM WL1",   64, 64, 32},
+    {"GeMM WL2",   64, 128, 32},
+    {"GeMM WL3",   64, 576, 32},
+    {"GeMV WL1",   1536, 576, 1},
+    {"GeMV WL2",   3072, 1024, 1},
+    {"GeMV WL3",   2816, 2048, 1}
   };
 
   // Per-case results, printed in the summary at the end

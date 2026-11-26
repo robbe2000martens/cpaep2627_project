@@ -6,13 +6,16 @@
 // its accumulator (output stationary) while the k-steps of the reduction
 // stream past it; one k-step covers D values of k and takes one cycle.
 // When the tile is finished it is drained through SRAM C, G words of
-// CLanes int32 values, and the next tile starts.
+// CLanes int32 values.
 //
 // Tile shape (see gemm_accelerator_new_top.sv):
 //   GeMM (N > 1)  : TM x W = H x W outputs, one per PE
-//   GeMV (N == 1) : TM = GemvRows rows of y; row r of the tile is held by
-//                   PE (r % H, r / H), i.e. PE column 0 and the top of
-//                   column 1 (GemvRows = 96 for H = 64)
+//   GeMV (N == 1) : TM = GemvRows rows of y, held by one of PeBanks PE
+//                   banks. Counting the PEs column-major, PE bank b is
+//                   PEs b*S .. b*S + GemvRows-1, S = GemvWords*CLanes
+//                   (GemvRows rounded up to whole C words). For H = 64
+//                   and 96 rows: bank 0 = PE column 0 and the top of
+//                   column 1, bank 1 = the bottom of column 1 and column 2
 //
 // SRAM A is two banks with the same address: A_lo holds rows 0 .. H-1 of
 // a word, A_hi rows H .. GemvRows-1. Only a GeMV tile with more than H
@@ -28,20 +31,31 @@
 //       drain the tile: G words to SRAM C
 //
 // Timing of one tile (the SRAMs have a one cycle read latency):
-//   Compute : Kt cycles, one A and one B read per cycle
-//   Wait    : 1 cycle, the last k-step is being accumulated
-//   Drain   : G cycles, one C word per cycle. In the last drain cycle the
-//             first read of the next tile is already issued: its data
-//             reaches the PEs (init_save) in the cycle after the last
-//             write, so nothing is overwritten too early.
-//   => Kt + G cycles per tile.
+//   Read  : Kt cycles, one A and one B read (one k-step) per cycle
+//   Wait  : 1 cycle, the last k-step is being accumulated
+//   Drain : G cycles, one C word per cycle
+// Reading and draining are two state machines, so the tiles can follow
+// each other in two ways:
+//   One by one (a GeMM, which needs every PE, and a GeMV with
+//   Kt <= GemvWords): the next tile's first read is issued in the last
+//   drain cycle. Its data reaches the PEs (init_save) in the cycle after
+//   the last write, so nothing is overwritten too early.
+//     => Kt + G cycles per tile
+//   Overlapped (a GeMV with Kt > GemvWords and two PE banks): the tiles
+//   take turns between the banks. The next tile is read into the other
+//   bank right after the last k-step, while this tile waits and drains.
+//   The drain (G <= GemvWords words) ends no later than the next tile's
+//   last k-step, so two drains never collide, and a bank is only read
+//   again two tiles later, after its drain.
+//     => Kt cycles per tile, plus 1 + G for the drain of the last tile
 //
 // G depends on the outputs of the tile that are drained (the drain order
 // is column-major, see gemm_accelerator_new_top.sv):
 //   GeMM: all H rows of the valid columns
 //         n_valid = min(W, N - nt*W),          G = ceil(H * n_valid / CLanes)
-//   GeMV: the valid rows of y, which are the first outputs of the tile
+//   GeMV: the valid rows of y, which are the first outputs of the PE bank
 //         m_valid = min(TM, M - mt*TM),        G = ceil(m_valid / CLanes)
+//         PE bank b starts at drain word b*GemvWords
 //
 // Parameters:
 // - SizeWidth   : width of the M, K, N size inputs (in elements)
@@ -51,6 +65,8 @@
 // - GemvRows    : rows of y per GeMV tile (rows per SRAM A word), H .. H*W
 // - CLanes      : int32 values per SRAM C word
 // - AddrWidth   : width of the SRAM C address
+// - PeBanks     : PE banks for GeMV tiles: 2 overlaps the tiles, 1 runs
+//                 them one by one (2 needs 2*GemvWords*CLanes <= H*W)
 //---------------------------
 
 module gemm_controller_new #(
@@ -61,9 +77,13 @@ module gemm_controller_new #(
   parameter int unsigned GemvRows    = 96,
   parameter int unsigned CLanes      = 6,
   parameter int unsigned AddrWidth   = 17,
+  parameter int unsigned PeBanks     = 2,
   // Derived: most drain words of one tile, and the drain index width
   parameter int unsigned MaxGroups   = (ArrayHeight*ArrayWidth + CLanes - 1) / CLanes,
-  parameter int unsigned GroupWidth  = (MaxGroups <= 1) ? 1 : $clog2(MaxGroups)
+  parameter int unsigned GroupWidth  = (MaxGroups <= 1) ? 1 : $clog2(MaxGroups),
+  // Derived: drain words of a full GeMV tile, which is also the first
+  // drain word of PE bank 1
+  parameter int unsigned GemvWords   = (GemvRows + CLanes - 1) / CLanes
 )(
   input  logic                  clk_i,
   input  logic                  rst_ni,
@@ -83,11 +103,12 @@ module gemm_controller_new #(
   output logic                  data_valid_o,  // A/B data at the PEs is valid
   output logic                  init_save_o,   // ... and it is the first k-step
   output logic                  gemv_o,        // ... and it belongs to a GeMV
+  output logic                  pe_bank_o,     // ... in this PE bank (GeMV only)
   output logic [GemvRows-1:0]   row_valid_o,   // rows of the tile with real data
   output logic [ArrayWidth-1:0] col_valid_o,   // PE columns with real data
   // Drain control
   output logic                  c_we_o,        // write one SRAM C word
-  output logic [GroupWidth-1:0] drain_idx_o,   // which word of the tile
+  output logic [GroupWidth-1:0] drain_idx_o,   // which word of the PE array
   output logic [AddrWidth-1:0]  c_addr_o,      // SRAM C address
   output logic                  busy_o,
   output logic                  done_o
@@ -113,6 +134,15 @@ module gemm_controller_new #(
   assign Nt   = (N_size_i + ArrayWidth  - 1) / ArrayWidth;
   assign Kt   = (K_size_i + ArrayDepth  - 1) / ArrayDepth;
   assign Kt_o = Kt;
+
+  //-----------------------
+  // Overlap the tiles (see the timing above): only a GeMV, only with two
+  // PE banks, and only if a drain ends in time, Kt > GemvWords.
+  // Static during a run, like the sizes.
+  //-----------------------
+  logic overlap;
+
+  assign overlap = (PeBanks > 1) && gemv && (Kt > SizeWidth'(GemvWords));
 
   //-----------------------
   // Loop counters: K innermost, then N, then M
@@ -193,18 +223,25 @@ module gemm_controller_new #(
     for (int n = 0; n < ArrayWidth; n++) col_mask[n] = (n < n_valid);
   end
 
+  // PE bank of the tile at the counters: with overlap the tiles take
+  // turns, even tiles in bank 0 and odd ones in bank 1 (in a GeMV nt is
+  // always 0, so mt counts the tiles). Without overlap: always bank 0.
+  logic pe_bank;
+
+  assign pe_bank = overlap && mt_o[0];
+
   // Latched at the last k-step of a tile, used while that tile drains
   // (by then the counters already point at the next tile)
-  logic [GroupWidth-1:0] g_last_q;     // G - 1 of the draining tile
-  logic                  tile_last_q;  // the draining tile is the last one
+  logic [GroupWidth-1:0] g_last_q;      // G - 1 of the draining tile
+  logic                  drain_bank_q;  // PE bank of the draining tile
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      g_last_q    <= '0;
-      tile_last_q <= 1'b0;
+      g_last_q     <= '0;
+      drain_bank_q <= 1'b0;
     end else if (k_wrap) begin
-      g_last_q    <= GroupWidth'(groups - 1);
-      tile_last_q <= m_wrap;
+      g_last_q     <= GroupWidth'(groups - 1);
+      drain_bank_q <= pe_bank;
     end
   end
 
@@ -216,6 +253,7 @@ module gemm_controller_new #(
   logic                   data_valid_q;
   logic                   first_k_q;
   logic                   gemv_q;
+  logic                   pe_bank_q;
   logic [GemvRows-1:0]    row_valid_q;
   logic [ArrayWidth-1:0]  col_valid_q;
 
@@ -224,6 +262,7 @@ module gemm_controller_new #(
       data_valid_q <= 1'b0;
       first_k_q    <= 1'b0;
       gemv_q       <= 1'b0;
+      pe_bank_q    <= 1'b0;
       row_valid_q  <= '0;
       col_valid_q  <= '0;
     end else begin
@@ -231,6 +270,7 @@ module gemm_controller_new #(
       first_k_q    <= move_k && (kt_o == '0);
       if (move_k) begin
         gemv_q      <= gemv;
+        pe_bank_q   <= pe_bank;
         row_valid_q <= row_mask;
         col_valid_q <= col_mask;
       end
@@ -241,6 +281,7 @@ module gemm_controller_new #(
   assign data_valid_o = data_valid_q;
   assign init_save_o  = first_k_q;
   assign gemv_o       = gemv_q;
+  assign pe_bank_o    = pe_bank_q;
   assign row_valid_o  = row_valid_q;
   assign col_valid_o  = col_valid_q;
 
@@ -258,61 +299,109 @@ module gemm_controller_new #(
   end
 
   //-----------------------
-  // Main state machine
+  // State machines
+  //
+  // Read side: issues the k-steps (move_k)
+  //   Idle    : wait for start, then issue the first k-step at once
+  //   Compute : one k-step per cycle
+  //   Hold    : one by one: the tile drains before the next one starts,
+  //             whose first k-step is issued in the last drain cycle
+  //   Finish  : every k-step is issued, wait for the last drain
+  // After a k-step (after_k) the same tile goes on, or its last k-step
+  // hands the tile to the drain side and the read side goes on with the
+  // next tile (overlap), holds, or finishes.
+  //
+  // Drain side: writes the finished tile to SRAM C
+  //   DrainIdle : nothing to drain
+  //   DrainWait : the last k-step of the tile is accumulated
+  //   Drain     : one C word per cycle, G cycles. With overlap the next
+  //               tile can be handed over in the last drain cycle
+  //               (Kt = GemvWords + 1); its drain then follows at once.
   //-----------------------
   typedef enum logic [1:0] {
     Idle,
     Compute,
-    Wait,
-    Drain
-  } state_t;
+    Hold,
+    Finish
+  } read_state_t;
 
-  state_t                state_q, state_d;
-  logic [GroupWidth-1:0] g_q;        // drain word counter
-  logic [AddrWidth-1:0]  c_addr_q;   // next SRAM C address
+  typedef enum logic [1:0] {
+    DrainIdle,
+    DrainWait,
+    Drain
+  } drain_state_t;
+
+  read_state_t           read_q, read_d, after_k;
+  drain_state_t          drain_q, drain_d;
+  logic [GroupWidth-1:0] g_q;          // drain word counter
+  logic [AddrWidth-1:0]  c_addr_q;     // next SRAM C address
+  logic                  drain_last;   // the last word of the tile is written
   logic                  c_we;
 
-  always_comb begin
-    state_d = state_q;
-    move_k  = 1'b0;
-    c_we    = 1'b0;
-    done_o  = 1'b0;
+  assign drain_last = (drain_q == Drain) && (g_q == g_last_q);
 
-    unique case (state_q)
-      // Wait for start, then issue the first k-step at once
+  always_comb begin
+    if      (!k_wrap) after_k = Compute;
+    else if (m_wrap)  after_k = Finish;
+    else if (overlap) after_k = Compute;
+    else              after_k = Hold;
+  end
+
+  always_comb begin
+    read_d = read_q;
+    move_k = 1'b0;
+    done_o = 1'b0;
+
+    unique case (read_q)
       Idle: begin
         if (start_i) begin
-          move_k  = 1'b1;
-          state_d = k_wrap ? Wait : Compute;
+          move_k = 1'b1;
+          read_d = after_k;
         end
       end
 
-      // One k-step per cycle until the last one of the tile is issued
       Compute: begin
         move_k = 1'b1;
-        if (k_wrap) state_d = Wait;
+        read_d = after_k;
       end
 
-      // The last k-step is accumulated in this cycle
-      Wait: begin
-        state_d = Drain;
-      end
-
-      // Write G words; the last cycle also starts the next tile
-      Drain: begin
-        c_we = 1'b1;
-        if (g_q == g_last_q) begin
-          if (tile_last_q) begin
-            done_o  = 1'b1;     // same cycle as the last C write
-            state_d = Idle;
-          end else begin
-            move_k  = 1'b1;     // first k-step of the next tile
-            state_d = k_wrap ? Wait : Compute;
-          end
+      Hold: begin
+        if (drain_last) begin
+          move_k = 1'b1;        // first k-step of the next tile
+          read_d = after_k;
         end
       end
 
-      default: state_d = Idle;
+      Finish: begin
+        if (drain_last) begin
+          done_o = 1'b1;        // same cycle as the last C write
+          read_d = Idle;
+        end
+      end
+
+      default: read_d = Idle;
+    endcase
+  end
+
+  always_comb begin
+    drain_d = drain_q;
+    c_we    = 1'b0;
+
+    unique case (drain_q)
+      DrainIdle: begin
+        if (k_wrap) drain_d = DrainWait;
+      end
+
+      DrainWait: begin
+        drain_d = Drain;
+      end
+
+      Drain: begin
+        c_we = 1'b1;
+        if (drain_last) drain_d = k_wrap ? DrainWait : DrainIdle;
+      end
+
+      default: drain_d = DrainIdle;
     endcase
   end
 
@@ -322,20 +411,38 @@ module gemm_controller_new #(
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      state_q  <= Idle;
+      read_q   <= Idle;
+      drain_q  <= DrainIdle;
       g_q      <= '0;
       c_addr_q <= '0;
     end else begin
-      state_q  <= state_d;
-      g_q      <= (state_q == Drain) ? g_q + 1'b1 : '0;
-      if (state_q == Idle) c_addr_q <= '0;
-      else if (c_we)       c_addr_q <= c_addr_q + 1'b1;
+      read_q   <= read_d;
+      drain_q  <= drain_d;
+      g_q      <= (drain_q == Drain && !drain_last) ? g_q + 1'b1 : '0;
+      if (read_q == Idle) c_addr_q <= '0;
+      else if (c_we)      c_addr_q <= c_addr_q + 1'b1;
     end
   end
 
   assign c_we_o      = c_we;
-  assign drain_idx_o = g_q;
+  assign drain_idx_o = drain_bank_q ? GroupWidth'(GemvWords + g_q) : g_q;
   assign c_addr_o    = c_addr_q;
-  assign busy_o      = (state_q != Idle);
+  assign busy_o      = (read_q != Idle);
+
+  //-----------------------
+  // Simulation checks of the overlap; Kt > GemvWords rules both out:
+  // - a tile is handed to the drain side only when that side is idle or
+  //   in its last cycle (else g_last_q and drain_bank_q would change
+  //   under a running drain)
+  // - k-step data never reaches a PE bank that still has words to drain
+  //   (its accumulators would change before they are written out)
+  //-----------------------
+  always @(posedge clk_i) begin
+    if (rst_ni && k_wrap && !(drain_q == DrainIdle || drain_last))
+      $error("%m: tile %0d is done while the previous tile still drains", mt_o);
+    if (rst_ni && data_valid_q && drain_q == Drain && !drain_last &&
+        pe_bank_q == drain_bank_q)
+      $error("%m: k-step data reaches PE bank %0d while it drains", pe_bank_q);
+  end
 
 endmodule

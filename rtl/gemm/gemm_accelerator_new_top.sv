@@ -15,11 +15,17 @@
 //   The A word has only H rows, all in bank A_lo; bank A_hi is not read.
 //
 // GeMV (N == 1, y = A x): a tile is ARows = APortWidth / (8*D) rows of y,
-// more than the H PEs of column 0 can hold. PE (m, n) owns row
-// r = n*H + m of the tile: rows 0 .. H-1 fill PE column 0, the rest the
-// top of column 1 (64 + 32 = 96 rows for a 768-bit A port).
+// more than the H PEs of column 0 can hold. The tiles take turns between
+// two PE banks, so one bank drains while the next tile is computed in the
+// other (see gemm_controller_new.sv). Counting the PEs column-major,
+// p = n*H + m, PE bank b starts at p = b*S, S = ARows rounded up to whole
+// C words, and holds row r of its tile in PE p = b*S + r. For a 768-bit
+// A port (96 rows, S = 96):
+//   bank 0 = PE column 0 and rows  0 .. 31 of column 1
+//   bank 1 = rows 32 .. 63 of column 1 and PE column 2
 //   * SRAM A word (mt, kt) = A[mt*ARows +: ARows][kt*D +: D]; row r goes
-//     to PE (r % H, r / H) only
+//     to the PE of row r in each bank, and only the bank of the tile
+//     uses it
 //   * SRAM B word (0, kt)  = x[kt*D +: D] in lane 0, as in a GeMM; every
 //     PE column that holds rows of y takes lane 0 as its B operand
 //
@@ -40,9 +46,11 @@
 // Parameters:
 // - ArrayHeight/Width/Depth : H, W, D of the MAC array (H*W*D <= 512)
 // - APortWidth              : SRAM A word, ARows rows of D int8 values,
-//                             H <= ARows <= H*W (ARows = H: a GeMV only
-//                             uses PE column 0 and there is no A_hi);
-//                             A_lo gets 8*H*D bits, A_hi the rest
+//                             H <= ARows <= H*W (ARows = H: a GeMV bank
+//                             is one PE column and there is no A_hi);
+//                             A_lo gets 8*H*D bits, A_hi the rest.
+//                             Two PE banks need 2*S <= H*W; otherwise
+//                             there is one and the tiles run one by one
 // - BPortWidth              : one k-step of B per word: 8*W*D bits
 // - CPortWidth              : SRAM C word, a multiple of 32 bits
 //   (A_lo + A_hi + B + C port widths must stay within the 1,024-bit budget)
@@ -84,12 +92,16 @@ module gemm_accelerator_new_top #(
   localparam int unsigned NumOut    = ArrayHeight * ArrayWidth;
   localparam int unsigned MaxGroups = (NumOut + CLanes - 1) / CLanes;
   localparam int unsigned GroupWidth = (MaxGroups <= 1) ? 1 : $clog2(MaxGroups);
+  // GeMV PE banks: S = BankStride PEs apart, so each starts at a C word
+  // boundary; two if they fit in the array
+  localparam int unsigned BankStride = ((ARows + CLanes - 1) / CLanes) * CLanes;
+  localparam int unsigned PeBanks    = (2*BankStride <= NumOut) ? 2 : 1;
 
   //---------------------------
-  // Controller: tile counters, FSM and drain sequencing
+  // Controller: tile counters, FSMs and drain sequencing
   //---------------------------
   logic [SizeAddrWidth-1:0] mt, nt, kt, Kt;
-  logic                     mem_re, a_hi_re, valid_data, init_save, busy, gemv;
+  logic                     mem_re, a_hi_re, valid_data, init_save, busy, gemv, pe_bank;
   logic [ARows-1:0]         row_valid;
   logic [ArrayWidth-1:0]    col_valid;
   logic [GroupWidth-1:0]    drain_idx;
@@ -101,7 +113,8 @@ module gemm_accelerator_new_top #(
     .ArrayDepth   ( ArrayDepth    ),
     .GemvRows     ( ARows         ),
     .CLanes       ( CLanes        ),
-    .AddrWidth    ( AddrWidth     )
+    .AddrWidth    ( AddrWidth     ),
+    .PeBanks      ( PeBanks       )
   ) i_gemm_controller (
     .clk_i        ( clk_i         ),
     .rst_ni       ( rst_ni        ),
@@ -118,6 +131,7 @@ module gemm_accelerator_new_top #(
     .data_valid_o ( valid_data    ),
     .init_save_o  ( init_save     ),
     .gemv_o       ( gemv          ),
+    .pe_bank_o    ( pe_bank       ),
     .row_valid_o  ( row_valid     ),
     .col_valid_o  ( col_valid     ),
     .c_we_o       ( sram_c_we_o   ),
@@ -151,14 +165,15 @@ module gemm_accelerator_new_top #(
 
   //---------------------------
   // B operand of each PE column, broadcast down the column. In GeMV mode
-  // every column that holds rows of y multiplies with x, which is lane 0.
+  // every column that holds rows of y (PEs of a bank) multiplies with x,
+  // which is lane 0.
   //---------------------------
   logic [ArrayWidth-1:0][ArrayDepth-1:0][InDataWidth-1:0] b_col;
 
   genvar m, n, k;
   for (n = 0; n < ArrayWidth; n++) begin : gen_b_col
     for (k = 0; k < ArrayDepth; k++) begin : gen_k
-      if (n > 0 && n*ArrayHeight < ARows) begin : gen_gemv
+      if (n > 0 && n*ArrayHeight < PeBanks*BankStride) begin : gen_gemv
         assign b_col[n][k] = gemv ? b_tile[k][0] : b_tile[k][n];
       end else begin : gen_gemm
         assign b_col[n][k] = b_tile[k][n];
@@ -168,16 +183,21 @@ module gemm_accelerator_new_top #(
 
   //---------------------------
   // The PE grid
-  // In GeMV mode PE (m, n) holds row R = n*H + m of y if R < ARows. This
-  // needs an A multiplexer only for n > 0: in column 0, R = m and both
-  // modes read the same A row.
+  // In GeMV mode PE p = n*H + m (column-major) is in PE bank B = p / S
+  // and holds row R = p % S of that bank's tile, if B < PeBanks and
+  // R < ARows. Such a PE needs an A multiplexer only if R != m: in
+  // column 0 (bank 0, R = m) both modes read the same A row.
   //
   // Operand isolation: a PE without valid data gets constant zero
   // operands, so its multiplier does not toggle (no switching energy).
   //   GeMM: PE (m, n) is busy if row m and column n of the tile exist
-  //   GeMV: PE (m, n) is busy if row R of the tile exists in y
-  //         (R < ARows and mt*ARows + R < M)
-  // e.g. columns 2..W-1 and the lower half of column 1 idle in a GeMV.
+  //   GeMV: PE (m, n) is busy if its bank holds the tile being read and
+  //         row R of that tile exists in y (mt*ARows + R < M)
+  // e.g. columns 3..W-1 and the bank that drains idle in a GeMV.
+  //
+  // Bank hold: in GeMV mode a PE of the other bank gets no valid and no
+  // init_save either (pe_live), so its accumulator keeps the result that
+  // is being drained. In a GeMM every PE takes every k-step, as before.
   //
   // The old A_hi lanes of a tile that does not read A_hi never reach a
   // multiplier: a GeMM PE takes a_tile[m] (m < H), and in a GeMV tile of
@@ -185,45 +205,51 @@ module gemm_accelerator_new_top #(
   //---------------------------
   for (m = 0; m < ArrayHeight; m++) begin : gen_pe_row
     for (n = 0; n < ArrayWidth; n++) begin : gen_pe_col
-      localparam int unsigned R = n*ArrayHeight + m;  // row of y in GeMV mode
+      localparam int unsigned P = n*ArrayHeight + m;  // column-major PE index
+      localparam int unsigned B = P / BankStride;     // PE bank in GeMV mode
+      localparam int unsigned R = P % BankStride;     // row of y in GeMV mode
 
-      logic                                          pe_en;
+      logic                                          pe_en, pe_live;
       logic signed [ArrayDepth-1:0][InDataWidth-1:0] a_src, a_pe, b_pe;
 
-      if (n > 0 && R < ARows) begin : gen_gemv
-        assign a_src = gemv ? a_tile[R]    : a_tile[m];
-        assign pe_en = gemv ? row_valid[R] : (row_valid[m] && col_valid[n]);
+      if (B < PeBanks && R < ARows) begin : gen_gemv
+        assign pe_live = !gemv || (pe_bank == 1'(B));
+        assign a_src   = gemv ? a_tile[R] : a_tile[m];
+        assign pe_en   = gemv ? (row_valid[R] && pe_live)
+                              : (row_valid[m] && col_valid[n]);
       end else begin : gen_gemm
-        assign a_src = a_tile[m];
-        assign pe_en = row_valid[m] && col_valid[n];
+        assign pe_live = 1'b1;
+        assign a_src   = a_tile[m];
+        assign pe_en   = row_valid[m] && col_valid[n];
       end
 
       assign a_pe = pe_en ? a_src    : '0;
       assign b_pe = pe_en ? b_col[n] : '0;
 
       general_mac_pe #(
-        .InDataWidth  ( InDataWidth  ),
-        .NumInputs    ( ArrayDepth   ),
-        .OutDataWidth ( OutDataWidth )
+        .InDataWidth  ( InDataWidth           ),
+        .NumInputs    ( ArrayDepth            ),
+        .OutDataWidth ( OutDataWidth          )
       ) i_mac_pe (
-        .clk_i        ( clk_i        ),
-        .rst_ni       ( rst_ni       ),
-        .a_i          ( a_pe         ),
-        .b_i          ( b_pe         ),
-        .a_valid_i    ( valid_data   ),
-        .b_valid_i    ( valid_data   ),
-        .init_save_i  ( init_save    ),
-        .acc_clr_i    ( !busy        ),
-        .c_o          ( c_cm[n][m]   )
+        .clk_i        ( clk_i                 ),
+        .rst_ni       ( rst_ni                ),
+        .a_i          ( a_pe                  ),
+        .b_i          ( b_pe                  ),
+        .a_valid_i    ( valid_data && pe_live ),
+        .b_valid_i    ( valid_data && pe_live ),
+        .init_save_i  ( init_save  && pe_live ),
+        .acc_clr_i    ( !busy                 ),
+        .c_o          ( c_cm[n][m]            )
       );
     end
   end
 
   //---------------------------
-  // Drain: word drain_idx of the tile = outputs p = drain_idx*CLanes ...
-  // (a MaxGroups-to-1 multiplexer of CPortWidth-bit slices). The same in
-  // both modes: the rows of y of a GeMV tile are its first outputs in
-  // column-major order.
+  // Drain: word drain_idx of the PE array = outputs p = drain_idx*CLanes
+  // ... (a MaxGroups-to-1 multiplexer of CPortWidth-bit slices). In a
+  // GeMM it is the word of the tile. The rows of y of a GeMV tile are the
+  // first outputs of its bank, which starts at word B*S / CLanes; the
+  // controller adds that offset.
   //---------------------------
   logic [MaxGroups*CPortWidth-1:0] c_flat;
 
