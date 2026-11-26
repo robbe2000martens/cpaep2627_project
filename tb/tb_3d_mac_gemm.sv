@@ -17,10 +17,14 @@ module tb_3d_mac_gemm;
   parameter int unsigned ArrayDepth    = 1;      // D, MACs per PE (k)
 
   // SRAM ports: 1024 bits cumulative
-  parameter int unsigned APortWidth    = InDataWidth * ArrayHeight * ArrayDepth;
+  // An A word holds 96 rows of int8: a GeMM uses the first H = 64 (one per
+  // PE row), a GeMV all 96 (rows of y: PE column 0 plus the top 32 PEs of
+  // column 1). C gets the rest: 192 bits = 6 int32 per word.
+  parameter int unsigned APortWidth    = 768;
   parameter int unsigned BPortWidth    = InDataWidth * ArrayWidth  * ArrayDepth;
   parameter int unsigned CPortWidth    = ((1024 - APortWidth - BPortWidth) / OutDataWidth) * OutDataWidth;
   localparam int unsigned CLanes       = CPortWidth / OutDataWidth;
+  localparam int unsigned GemvRows     = APortWidth / (InDataWidth * ArrayDepth);  // rows of y per GeMV tile
 
   initial begin
     if (APortWidth + BPortWidth + CPortWidth > 1024)
@@ -28,6 +32,10 @@ module tb_3d_mac_gemm;
              APortWidth + BPortWidth + CPortWidth);
     if (ArrayHeight * ArrayWidth * ArrayDepth > 512)
       $fatal(1, "%0d MACs, budget is 512", ArrayHeight * ArrayWidth * ArrayDepth);
+    if (GemvRows * InDataWidth * ArrayDepth != APortWidth ||
+        GemvRows < ArrayHeight || GemvRows > ArrayHeight * ArrayWidth)
+      $fatal(1, "SRAM A word of %0d bits: it must hold %0d to %0d rows of %0d int8",
+             APortWidth, ArrayHeight, ArrayHeight * ArrayWidth, ArrayDepth);
   end
 
   //---------------------------
@@ -183,26 +191,29 @@ module tb_3d_mac_gemm;
   endfunction
 
   //---------------------------
-  // Packing: the layout must match gemm_accelerator_top.sv
-  //   SRAM A word mt*Kt + kt : A(mt*H + m, kt*D + k) at bits [(m*D + k)*8 +: 8]
+  // Packing: the layout must match gemm_accelerator_new_top.sv
+  //   SRAM A word mt*Kt + kt : A(mt*TM + m, kt*D + k) at bits [(m*D + k)*8 +: 8]
+  //                            TM = H rows for a GeMM, GemvRows for a GeMV
   //   SRAM B word nt*Kt + kt : B(kt*D + k, nt*W + n) at bits [(k*W + n)*8 +: 8]
-  // Elements outside the matrix are zero (padding).
+  // Elements outside the matrix are zero (padding), and so are the
+  // GemvRows - H unused rows of an A word in a GeMM.
   //---------------------------
   task automatic pack_inputs(input int unsigned M, input int unsigned K, input int unsigned N);
     logic [APortWidth-1:0] a_word;
     logic [BPortWidth-1:0] b_word;
-    int unsigned Mt, Kt, Nt, row, col;
+    int unsigned TM, Mt, Kt, Nt, row, col;
 
-    Mt = ceil_div(M, ArrayHeight);
+    TM = (N == 1) ? GemvRows : ArrayHeight;   // rows of A per word
+    Mt = ceil_div(M, TM);
     Kt = ceil_div(K, ArrayDepth);
     Nt = ceil_div(N, ArrayWidth);
 
     for (int unsigned mt = 0; mt < Mt; mt++) begin
       for (int unsigned kt = 0; kt < Kt; kt++) begin
         a_word = '0;
-        for (int unsigned m = 0; m < ArrayHeight; m++) begin
+        for (int unsigned m = 0; m < TM; m++) begin
           for (int unsigned k = 0; k < ArrayDepth; k++) begin
-            row = mt*ArrayHeight + m;
+            row = mt*TM + m;
             col = kt*ArrayDepth  + k;
             if (row < M && col < K)
               a_word[(m*ArrayDepth + k)*InDataWidth +: InDataWidth] = A_matrix[row*K + col];
@@ -231,16 +242,37 @@ module tb_3d_mac_gemm;
   //---------------------------
   // Unpacking: SRAM C holds the drained tiles back to back, in loop order
   // (mt outer, nt inner). Tile output p = n*H + m (column-major) is in
-  // word p / CLanes of the tile, lane p % CLanes. Only the n_valid
-  // columns of a tile are drained: G = ceil(H*n_valid / CLanes) words.
+  // word p / CLanes of the tile, lane p % CLanes.
+  //   GeMM: only the n_valid columns of a tile are drained,
+  //         G = ceil(H*n_valid / CLanes) words
+  //   GeMV: output p is row mt*GemvRows + p of y; only the m_valid rows
+  //         of a tile are drained, G = ceil(m_valid / CLanes) words
   //---------------------------
   task automatic unpack_output(input int unsigned M, input int unsigned N);
     logic [CPortWidth-1:0] c_word;
-    int unsigned Mt, Nt, ptr, n_valid, groups, p, m, n, row, col;
+    int unsigned Mt, Nt, ptr, m_valid, n_valid, groups, p, m, n, row, col;
 
-    Mt  = ceil_div(M, ArrayHeight);
-    Nt  = ceil_div(N, ArrayWidth);
     ptr = 0;
+    if (N == 1) begin
+      Mt = ceil_div(M, GemvRows);
+      for (int unsigned mt = 0; mt < Mt; mt++) begin
+        m_valid = (M - mt*GemvRows < GemvRows) ? M - mt*GemvRows : GemvRows;
+        groups  = ceil_div(m_valid, CLanes);
+        for (int unsigned g = 0; g < groups; g++) begin
+          c_word = i_sram_c.memory[ptr];
+          ptr++;
+          for (int unsigned l = 0; l < CLanes; l++) begin
+            p = g*CLanes + l;
+            if (p < m_valid)
+              C_matrix[mt*GemvRows + p] = c_word[l*OutDataWidth +: OutDataWidth];
+          end
+        end
+      end
+      return;
+    end
+
+    Mt = ceil_div(M, ArrayHeight);
+    Nt = ceil_div(N, ArrayWidth);
     for (int unsigned mt = 0; mt < Mt; mt++) begin
       for (int unsigned nt = 0; nt < Nt; nt++) begin
         n_valid = (N - nt*ArrayWidth < ArrayWidth) ? N - nt*ArrayWidth : ArrayWidth;

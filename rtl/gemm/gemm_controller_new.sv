@@ -2,16 +2,22 @@
 // Tiled GeMM controller for an H x W x D output-stationary MAC array
 //
 // Description:
-// The array computes one H x W tile of C at a time. Each PE keeps one
-// output in its accumulator (output stationary) while the k-steps of the
-// reduction stream past it; one k-step covers D values of k and takes one
-// cycle. When the tile is finished it is drained through SRAM C, G words
-// of CLanes int32 values, and the next tile starts.
+// The array computes one tile of C at a time. Each PE keeps one output in
+// its accumulator (output stationary) while the k-steps of the reduction
+// stream past it; one k-step covers D values of k and takes one cycle.
+// When the tile is finished it is drained through SRAM C, G words of
+// CLanes int32 values, and the next tile starts.
+//
+// Tile shape (see gemm_accelerator_new_top.sv):
+//   GeMM (N > 1)  : TM x W = H x W outputs, one per PE
+//   GeMV (N == 1) : TM = GemvRows rows of y; row r of the tile is held by
+//                   PE (r % H, r / H), i.e. PE column 0 and the top of
+//                   column 1 (GemvRows = 96 for H = 64)
 //
 // Loop nest (only the sequential loops live here; the parfor loops over
-// m1 < H, n1 < W and k1 < D are the MAC array itself):
+// the PEs and k1 < D are the MAC array itself):
 //
-//   for mt = 0 .. Mt-1          // block of H rows of C       (M counter)
+//   for mt = 0 .. Mt-1          // block of TM rows of C      (M counter)
 //     for nt = 0 .. Nt-1        // block of W columns of C    (N counter)
 //       for kt = 0 .. Kt-1      // one k-step per cycle       (K counter)
 //         read SRAM A word (mt, kt) and SRAM B word (nt, kt)
@@ -26,15 +32,19 @@
 //             write, so nothing is overwritten too early.
 //   => Kt + G cycles per tile.
 //
-// G depends on the number of valid columns of the tile (the drain order
-// is column-major, see gemm_accelerator_top.sv):
-//   n_valid = min(W, N - nt*W),  G = ceil(H * n_valid / CLanes)
+// G depends on the outputs of the tile that are drained (the drain order
+// is column-major, see gemm_accelerator_new_top.sv):
+//   GeMM: all H rows of the valid columns
+//         n_valid = min(W, N - nt*W),          G = ceil(H * n_valid / CLanes)
+//   GeMV: the valid rows of y, which are the first outputs of the tile
+//         m_valid = min(TM, M - mt*TM),        G = ceil(m_valid / CLanes)
 //
 // Parameters:
 // - SizeWidth   : width of the M, K, N size inputs (in elements)
 // - ArrayHeight : H, PE rows    (parallel over m)
 // - ArrayWidth  : W, PE columns (parallel over n)
 // - ArrayDepth  : D, multipliers per PE (parallel over k)
+// - GemvRows    : rows of y per GeMV tile (rows per SRAM A word), H .. H*W
 // - CLanes      : int32 values per SRAM C word
 // - AddrWidth   : width of the SRAM C address
 //---------------------------
@@ -44,7 +54,8 @@ module gemm_controller_new #(
   parameter int unsigned ArrayHeight = 64,
   parameter int unsigned ArrayWidth  = 8,
   parameter int unsigned ArrayDepth  = 1,
-  parameter int unsigned CLanes      = 14,
+  parameter int unsigned GemvRows    = 96,
+  parameter int unsigned CLanes      = 6,
   parameter int unsigned AddrWidth   = 17,
   // Derived: most drain words of one tile, and the drain index width
   parameter int unsigned MaxGroups   = (ArrayHeight*ArrayWidth + CLanes - 1) / CLanes,
@@ -66,7 +77,8 @@ module gemm_controller_new #(
   output logic                  mem_re_o,      // read SRAM A and B this cycle
   output logic                  data_valid_o,  // A/B data at the PEs is valid
   output logic                  init_save_o,   // ... and it is the first k-step
-  output logic [ArrayHeight-1:0] row_valid_o,  // PE rows with real data
+  output logic                  gemv_o,        // ... and it belongs to a GeMV
+  output logic [GemvRows-1:0]   row_valid_o,   // rows of the tile with real data
   output logic [ArrayWidth-1:0] col_valid_o,   // PE columns with real data
   // Drain control
   output logic                  c_we_o,        // write one SRAM C word
@@ -77,12 +89,22 @@ module gemm_controller_new #(
 );
 
   //-----------------------
-  // Tile counts: ceil(size / array dimension)
-  // (constant divisors: shifts when the dimensions are powers of two)
+  // Mode: a GeMV (N == 1) uses tiles of GemvRows rows of y, a GeMM
+  // tiles of H x W outputs. The sizes only change between runs.
+  //-----------------------
+  logic gemv;
+
+  assign gemv = (N_size_i == SizeWidth'(1));
+
+  //-----------------------
+  // Tile counts: ceil(size / tile dimension)
+  // (constant divisors: shifts when the dimensions are powers of two;
+  // GemvRows = 96 is not, but the sizes are static during a run)
   //-----------------------
   logic [SizeWidth-1:0] Mt, Nt, Kt;
 
-  assign Mt   = (M_size_i + ArrayHeight - 1) / ArrayHeight;
+  assign Mt   = gemv ? (M_size_i + GemvRows    - 1) / GemvRows
+                     : (M_size_i + ArrayHeight - 1) / ArrayHeight;
   assign Nt   = (N_size_i + ArrayWidth  - 1) / ArrayWidth;
   assign Kt   = (K_size_i + ArrayDepth  - 1) / ArrayDepth;
   assign Kt_o = Kt;
@@ -140,24 +162,30 @@ module gemm_controller_new #(
   //-----------------------
   // Sized to what they can hold (32-bit ints would leave many bits that
   // never toggle and spoil the toggle coverage)
-  localparam int unsigned MValidWidth = $clog2(ArrayHeight + 1);
+  localparam int unsigned MValidWidth = $clog2(GemvRows + 1);
   localparam int unsigned NValidWidth = $clog2(ArrayWidth + 1);
 
   logic [SizeWidth-1:0]   m_left, n_left;    // rows/columns left from the tile on
   logic [MValidWidth-1:0] m_valid;           // valid rows of the tile
   logic [NValidWidth-1:0] n_valid;           // valid columns of the tile
   logic [GroupWidth:0]    groups;            // drain words of the tile
-  logic [ArrayHeight-1:0] row_mask;
+  logic [GemvRows-1:0]    row_mask;          // only the first H bits in a GeMM
   logic [ArrayWidth-1:0]  col_mask;
 
   always_comb begin
-    m_left  = M_size_i - SizeWidth'(mt_o * ArrayHeight);
-    m_valid = (m_left >= ArrayHeight) ? MValidWidth'(ArrayHeight) : MValidWidth'(m_left);
+    if (gemv) begin
+      m_left  = M_size_i - SizeWidth'(mt_o * GemvRows);
+      m_valid = (m_left >= GemvRows) ? MValidWidth'(GemvRows) : MValidWidth'(m_left);
+    end else begin
+      m_left  = M_size_i - SizeWidth'(mt_o * ArrayHeight);
+      m_valid = (m_left >= ArrayHeight) ? MValidWidth'(ArrayHeight) : MValidWidth'(m_left);
+    end
     n_left  = N_size_i - SizeWidth'(nt_o * ArrayWidth);
     n_valid = (n_left >= ArrayWidth) ? NValidWidth'(ArrayWidth) : NValidWidth'(n_left);
-    groups  = (GroupWidth+1)'((ArrayHeight * n_valid + CLanes - 1) / CLanes);
-    for (int m = 0; m < ArrayHeight; m++) row_mask[m] = (m < m_valid);
-    for (int n = 0; n < ArrayWidth;  n++) col_mask[n] = (n < n_valid);
+    groups  = gemv ? (GroupWidth+1)'((m_valid + CLanes - 1) / CLanes)
+                   : (GroupWidth+1)'((ArrayHeight * n_valid + CLanes - 1) / CLanes);
+    for (int r = 0; r < GemvRows;   r++) row_mask[r] = (r < m_valid);
+    for (int n = 0; n < ArrayWidth; n++) col_mask[n] = (n < n_valid);
   end
 
   // Latched at the last k-step of a tile, used while that tile drains
@@ -182,19 +210,22 @@ module gemm_controller_new #(
   //-----------------------
   logic                   data_valid_q;
   logic                   first_k_q;
-  logic [ArrayHeight-1:0] row_valid_q;
+  logic                   gemv_q;
+  logic [GemvRows-1:0]    row_valid_q;
   logic [ArrayWidth-1:0]  col_valid_q;
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       data_valid_q <= 1'b0;
       first_k_q    <= 1'b0;
+      gemv_q       <= 1'b0;
       row_valid_q  <= '0;
       col_valid_q  <= '0;
     end else begin
       data_valid_q <= move_k;
       first_k_q    <= move_k && (kt_o == '0);
       if (move_k) begin
+        gemv_q      <= gemv;
         row_valid_q <= row_mask;
         col_valid_q <= col_mask;
       end
@@ -204,6 +235,7 @@ module gemm_controller_new #(
   assign mem_re_o     = move_k;
   assign data_valid_o = data_valid_q;
   assign init_save_o  = first_k_q;
+  assign gemv_o       = gemv_q;
   assign row_valid_o  = row_valid_q;
   assign col_valid_o  = col_valid_q;
 
