@@ -19,23 +19,28 @@ module tb_3d_mac_gemm;
   // SRAM ports: 1024 bits cumulative
   // An A word holds 96 rows of int8: a GeMM uses the first H = 64 (one per
   // PE row), a GeMV all 96 (rows of y: PE column 0 plus the top 32 PEs of
-  // column 1). C gets the rest: 192 bits = 6 int32 per word.
+  // column 1). The word is split over two SRAM banks with the same address,
+  // A_lo = rows 0..63 (512 bits) and A_hi = rows 64..95 (256 bits), so a
+  // GeMM only reads A_lo. C gets the rest: 192 bits = 6 int32 per word.
   parameter int unsigned APortWidth    = 768;
   parameter int unsigned BPortWidth    = InDataWidth * ArrayWidth  * ArrayDepth;
   parameter int unsigned CPortWidth    = ((1024 - APortWidth - BPortWidth) / OutDataWidth) * OutDataWidth;
   localparam int unsigned CLanes       = CPortWidth / OutDataWidth;
   localparam int unsigned GemvRows     = APortWidth / (InDataWidth * ArrayDepth);  // rows of y per GeMV tile
+  localparam int unsigned ALoWidth     = InDataWidth * ArrayDepth * ArrayHeight;   // SRAM A_lo word
+  localparam int unsigned AHiWidth     = APortWidth - ALoWidth;                    // SRAM A_hi word
 
   initial begin
-    if (APortWidth + BPortWidth + CPortWidth > 1024)
+    if (ALoWidth + AHiWidth + BPortWidth + CPortWidth > 1024)
       $fatal(1, "SRAM ports use %0d bits, budget is 1024",
-             APortWidth + BPortWidth + CPortWidth);
+             ALoWidth + AHiWidth + BPortWidth + CPortWidth);
     if (ArrayHeight * ArrayWidth * ArrayDepth > 512)
       $fatal(1, "%0d MACs, budget is 512", ArrayHeight * ArrayWidth * ArrayDepth);
+    // More than H rows: A_hi (rows H .. GemvRows-1) must hold at least one
     if (GemvRows * InDataWidth * ArrayDepth != APortWidth ||
-        GemvRows < ArrayHeight || GemvRows > ArrayHeight * ArrayWidth)
+        GemvRows <= ArrayHeight || GemvRows > ArrayHeight * ArrayWidth)
       $fatal(1, "SRAM A word of %0d bits: it must hold %0d to %0d rows of %0d int8",
-             APortWidth, ArrayHeight, ArrayHeight * ArrayWidth, ArrayDepth);
+             APortWidth, ArrayHeight + 1, ArrayHeight * ArrayWidth, ArrayDepth);
   end
 
   //---------------------------
@@ -88,35 +93,57 @@ module tb_3d_mac_gemm;
   logic signed [ InDataWidth-1:0] B_matrix [DataDepth];
   logic signed [OutDataWidth-1:0] C_matrix [DataDepth];
 
-  // Memory control
+  // Memory control (sram_a_addr goes to both SRAM A banks)
   logic [AddrWidth-1:0] sram_a_addr;
   logic [AddrWidth-1:0] sram_b_addr;
   logic [AddrWidth-1:0] sram_c_addr;
-  logic                 sram_a_re;
+  logic                 sram_a_lo_re;
+  logic                 sram_a_hi_re;
   logic                 sram_b_re;
 
   // Memory access
-  logic signed [APortWidth-1:0] sram_a_rdata;
+  logic signed [  ALoWidth-1:0] sram_a_lo_rdata;
+  logic signed [  AHiWidth-1:0] sram_a_hi_rdata;
+  logic signed [APortWidth-1:0] sram_a_rdata;      // {A_hi, A_lo}: one A word
   logic signed [BPortWidth-1:0] sram_b_rdata;
   logic signed [CPortWidth-1:0] sram_c_wdata;
   logic                         sram_c_we;
 
   //---------------------------
-  // Memories: one single_port_memory per port, only the word width changed
+  // Memories: one single_port_memory per port, only the word width changed.
+  // SRAM A is two of them with the same address: A_lo holds rows 0 .. H-1
+  // of an A word, A_hi rows H .. GemvRows-1. Each read costs its own width,
+  // so a GeMM, which only needs A_lo, does not pay for A_hi.
   //---------------------------
   single_port_memory #(
-    .DataWidth     ( APortWidth    ),
-    .DataDepth     ( DataDepth     ),
-    .AddrWidth     ( AddrWidth     )
-  ) i_sram_a (
-    .clk_i         ( clk_i         ),
-    .rst_ni        ( rst_ni        ),
-    .mem_addr_i    ( sram_a_addr   ),
-    .mem_re_i      ( sram_a_re     ),
-    .mem_we_i      ( '0            ),
-    .mem_wr_data_i ( '0            ),
-    .mem_rd_data_o ( sram_a_rdata  )
+    .DataWidth     ( ALoWidth        ),
+    .DataDepth     ( DataDepth       ),
+    .AddrWidth     ( AddrWidth       )
+  ) i_sram_a_lo (
+    .clk_i         ( clk_i           ),
+    .rst_ni        ( rst_ni          ),
+    .mem_addr_i    ( sram_a_addr     ),
+    .mem_re_i      ( sram_a_lo_re    ),
+    .mem_we_i      ( '0              ),
+    .mem_wr_data_i ( '0              ),
+    .mem_rd_data_o ( sram_a_lo_rdata )
   );
+
+  single_port_memory #(
+    .DataWidth     ( AHiWidth        ),
+    .DataDepth     ( DataDepth       ),
+    .AddrWidth     ( AddrWidth       )
+  ) i_sram_a_hi (
+    .clk_i         ( clk_i           ),
+    .rst_ni        ( rst_ni          ),
+    .mem_addr_i    ( sram_a_addr     ),
+    .mem_re_i      ( sram_a_hi_re    ),
+    .mem_we_i      ( '0              ),
+    .mem_wr_data_i ( '0              ),
+    .mem_rd_data_o ( sram_a_hi_rdata )
+  );
+
+  assign sram_a_rdata = {sram_a_hi_rdata, sram_a_lo_rdata};
 
   single_port_memory #(
     .DataWidth     ( BPortWidth    ),
@@ -170,7 +197,8 @@ module tb_3d_mac_gemm;
     .sram_a_addr_o  ( sram_a_addr  ),
     .sram_b_addr_o  ( sram_b_addr  ),
     .sram_c_addr_o  ( sram_c_addr  ),
-    .sram_a_re_o    ( sram_a_re    ),
+    .sram_a_lo_re_o ( sram_a_lo_re ),
+    .sram_a_hi_re_o ( sram_a_hi_re ),
     .sram_b_re_o    ( sram_b_re    ),
     .sram_a_rdata_i ( sram_a_rdata ),
     .sram_b_rdata_i ( sram_b_rdata ),
@@ -178,6 +206,22 @@ module tb_3d_mac_gemm;
     .sram_c_we_o    ( sram_c_we    ),
     .done_o         ( done         )
   );
+
+  //---------------------------
+  // SRAM A_hi check: only a GeMV tile with more than H rows of y may read
+  // A_hi. A needless read would not change the result, only cost energy,
+  // so the result check alone would not notice it.
+  //---------------------------
+  always @(posedge clk_i) begin : check_a_hi
+    int unsigned mt;   // tile of the A word being read
+
+    if (rst_ni && sram_a_hi_re) begin
+      mt = sram_a_addr / ceil_div(K_i, ArrayDepth);
+      if (N_i != 1 || M_i - mt*GemvRows <= ArrayHeight)
+        $error("SRAM A_hi read at address %0d, but that tile has no rows in A_hi",
+               sram_a_addr);
+    end
+  end
 
   //---------------------------
   // Tasks and functions
@@ -197,6 +241,8 @@ module tb_3d_mac_gemm;
   //   SRAM B word nt*Kt + kt : B(kt*D + k, nt*W + n) at bits [(k*W + n)*8 +: 8]
   // Elements outside the matrix are zero (padding), and so are the
   // GemvRows - H unused rows of an A word in a GeMM.
+  // Each A word is split over the banks: rows 0 .. H-1 (bits [ALoWidth-1:0])
+  // to A_lo, the rest to A_hi at the same address (all zero in a GeMM).
   //---------------------------
   task automatic pack_inputs(input int unsigned M, input int unsigned K, input int unsigned N);
     logic [APortWidth-1:0] a_word;
@@ -219,7 +265,8 @@ module tb_3d_mac_gemm;
               a_word[(m*ArrayDepth + k)*InDataWidth +: InDataWidth] = A_matrix[row*K + col];
           end
         end
-        i_sram_a.memory[mt*Kt + kt] = a_word;
+        i_sram_a_lo.memory[mt*Kt + kt] = a_word[ALoWidth-1:0];
+        i_sram_a_hi.memory[mt*Kt + kt] = a_word >> ALoWidth;
       end
     end
 
@@ -364,8 +411,9 @@ module tb_3d_mac_gemm;
 
     $display("");
     $display("==================================================================");
-    $display(" RESULTS  (array %0dx%0dx%0d, ports A %0d + B %0d + C %0d bits)",
-             ArrayHeight, ArrayWidth, ArrayDepth, APortWidth, BPortWidth, CPortWidth);
+    $display(" RESULTS  (array %0dx%0dx%0d, ports A %0d (%0d + %0d) + B %0d + C %0d bits)",
+             ArrayHeight, ArrayWidth, ArrayDepth, APortWidth, ALoWidth, AHiWidth,
+             BPortWidth, CPortWidth);
     $display("------------------------------------------------------------------");
     $display(" %s | %4s %4s %4s | %8s | %12s | %s",
              pad("Case", 8), "M", "K", "N", "Cycles", "Energy", "Check");

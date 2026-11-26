@@ -14,6 +14,10 @@
 //                   PE (r % H, r / H), i.e. PE column 0 and the top of
 //                   column 1 (GemvRows = 96 for H = 64)
 //
+// SRAM A is two banks with the same address: A_lo holds rows 0 .. H-1 of
+// a word, A_hi rows H .. GemvRows-1. Only a GeMV tile with more than H
+// rows of y reads A_hi (a_hi_re_o), so a GeMM never pays for it.
+//
 // Loop nest (only the sequential loops live here; the parfor loops over
 // the PEs and k1 < D are the MAC array itself):
 //
@@ -74,7 +78,8 @@ module gemm_controller_new #(
   output logic [SizeWidth-1:0]  kt_o,
   output logic [SizeWidth-1:0]  Kt_o,
   // Datapath control
-  output logic                  mem_re_o,      // read SRAM A and B this cycle
+  output logic                  mem_re_o,      // read SRAM A_lo and B this cycle
+  output logic                  a_hi_re_o,     // ... and SRAM A_hi too
   output logic                  data_valid_o,  // A/B data at the PEs is valid
   output logic                  init_save_o,   // ... and it is the first k-step
   output logic                  gemv_o,        // ... and it belongs to a GeMV
@@ -238,6 +243,19 @@ module gemm_controller_new #(
   assign gemv_o       = gemv_q;
   assign row_valid_o  = row_valid_q;
   assign col_valid_o  = col_valid_q;
+
+  //-----------------------
+  // SRAM A_hi read enable. A_hi holds rows H .. GemvRows-1 of an A word,
+  // so a k-step reads it only if its tile has more than H valid rows.
+  // row_mask belongs to the tile at the counters, which is the one being
+  // read, and has only its first H bits set in a GeMM: A_hi stays off in
+  // every GeMM and in a last GeMV tile of at most H rows.
+  //-----------------------
+  if (GemvRows > ArrayHeight) begin : gen_a_hi_re
+    assign a_hi_re_o = move_k && row_mask[ArrayHeight];
+  end else begin : gen_no_a_hi
+    assign a_hi_re_o = 1'b0;   // an A word has no rows for A_hi
+  end
 
   //-----------------------
   // Main state machine

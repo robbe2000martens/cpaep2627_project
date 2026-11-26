@@ -12,7 +12,7 @@
 // GeMM (N > 1): PE (m, n) owns C[mt*H + m][nt*W + n] of the current tile.
 //   * SRAM A word (mt, kt) = A[mt*H +: H][kt*D +: D], broadcast along PE row m
 //   * SRAM B word (nt, kt) = B[kt*D +: D][nt*W +: W], broadcast along PE column n
-//   The other ARows - H rows of an A word are not used (zero padding).
+//   The A word has only H rows, all in bank A_lo; bank A_hi is not read.
 //
 // GeMV (N == 1, y = A x): a tile is ARows = APortWidth / (8*D) rows of y,
 // more than the H PEs of column 0 can hold. PE (m, n) owns row
@@ -26,6 +26,12 @@
 // Memory words (element 0 in the LSBs):
 //   SRAM A, address mt*Kt + kt : A(r, k) at bits [(r*D + k)*8  +: 8]
 //   SRAM B, address nt*Kt + kt : B(k, n) at bits [(k*W + n)*8  +: 8]
+//   SRAM A is two banks with the same address, read as one word
+//   {A_hi, A_lo}: A_lo holds rows 0 .. H-1 (bits [8*H*D-1:0]), A_hi
+//   rows H .. ARows-1 (the rest). A_hi is only read for a GeMV tile with
+//   more than H rows (sram_a_hi_re_o); a GeMM or a short last GeMV tile
+//   skips it and saves its read energy. Its lanes then keep old data,
+//   which no PE uses (see the PE grid).
 //   SRAM C, address = running count of written words. Tiles are drained in
 //   loop order; within a tile, output p = n*H + m (column-major) goes to
 //   word p / CLanes, lane p % CLanes, i.e. bits [(p % CLanes)*32 +: 32].
@@ -35,10 +41,11 @@
 // - ArrayHeight/Width/Depth : H, W, D of the MAC array (H*W*D <= 512)
 // - APortWidth              : SRAM A word, ARows rows of D int8 values,
 //                             H <= ARows <= H*W (ARows = H: a GeMV only
-//                             uses PE column 0)
+//                             uses PE column 0 and there is no A_hi);
+//                             A_lo gets 8*H*D bits, A_hi the rest
 // - BPortWidth              : one k-step of B per word: 8*W*D bits
 // - CPortWidth              : SRAM C word, a multiple of 32 bits
-//   (A + B + C port widths must stay within the 1,024-bit budget)
+//   (A_lo + A_hi + B + C port widths must stay within the 1,024-bit budget)
 //---------------------------
 
 module gemm_accelerator_new_top #(
@@ -62,9 +69,10 @@ module gemm_accelerator_new_top #(
   output logic        [    AddrWidth-1:0] sram_a_addr_o,
   output logic        [    AddrWidth-1:0] sram_b_addr_o,
   output logic        [    AddrWidth-1:0] sram_c_addr_o,
-  output logic                            sram_a_re_o,
+  output logic                            sram_a_lo_re_o,
+  output logic                            sram_a_hi_re_o,
   output logic                            sram_b_re_o,
-  input  logic signed [   APortWidth-1:0] sram_a_rdata_i,
+  input  logic signed [   APortWidth-1:0] sram_a_rdata_i,  // {A_hi, A_lo}
   input  logic signed [   BPortWidth-1:0] sram_b_rdata_i,
   output logic signed [   CPortWidth-1:0] sram_c_wdata_o,
   output logic                            sram_c_we_o,
@@ -81,7 +89,7 @@ module gemm_accelerator_new_top #(
   // Controller: tile counters, FSM and drain sequencing
   //---------------------------
   logic [SizeAddrWidth-1:0] mt, nt, kt, Kt;
-  logic                     mem_re, valid_data, init_save, busy, gemv;
+  logic                     mem_re, a_hi_re, valid_data, init_save, busy, gemv;
   logic [ARows-1:0]         row_valid;
   logic [ArrayWidth-1:0]    col_valid;
   logic [GroupWidth-1:0]    drain_idx;
@@ -106,6 +114,7 @@ module gemm_accelerator_new_top #(
     .kt_o         ( kt            ),
     .Kt_o         ( Kt            ),
     .mem_re_o     ( mem_re        ),
+    .a_hi_re_o    ( a_hi_re       ),
     .data_valid_o ( valid_data    ),
     .init_save_o  ( init_save     ),
     .gemv_o       ( gemv          ),
@@ -120,12 +129,14 @@ module gemm_accelerator_new_top #(
 
   //---------------------------
   // Address generation (one word = one k-step of one tile; in GeMV mode
-  // mt counts tiles of ARows rows)
+  // mt counts tiles of ARows rows). Both SRAM A banks get the same
+  // address; A_hi is only read when the tile has rows there.
   //---------------------------
-  assign sram_a_re_o   = mem_re;
-  assign sram_b_re_o   = mem_re;
-  assign sram_a_addr_o = AddrWidth'(mt * Kt + kt);
-  assign sram_b_addr_o = AddrWidth'(nt * Kt + kt);
+  assign sram_a_lo_re_o = mem_re;
+  assign sram_a_hi_re_o = a_hi_re;
+  assign sram_b_re_o    = mem_re;
+  assign sram_a_addr_o  = AddrWidth'(mt * Kt + kt);
+  assign sram_b_addr_o  = AddrWidth'(nt * Kt + kt);
 
   //---------------------------
   // SRAM words viewed as tiles
@@ -167,6 +178,10 @@ module gemm_accelerator_new_top #(
   //   GeMV: PE (m, n) is busy if row R of the tile exists in y
   //         (R < ARows and mt*ARows + R < M)
   // e.g. columns 2..W-1 and the lower half of column 1 idle in a GeMV.
+  //
+  // The old A_hi lanes of a tile that does not read A_hi never reach a
+  // multiplier: a GeMM PE takes a_tile[m] (m < H), and in a GeMV tile of
+  // at most H rows the PEs of rows R >= H are not busy.
   //---------------------------
   for (m = 0; m < ArrayHeight; m++) begin : gen_pe_row
     for (n = 0; n < ArrayWidth; n++) begin : gen_pe_col
