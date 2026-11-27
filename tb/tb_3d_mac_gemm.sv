@@ -466,27 +466,38 @@ module tb_3d_mac_gemm;
   endfunction
 
   task automatic print_report();
-    int unsigned num_failed = 0;
+    int unsigned num_failed  = 0;
+    int unsigned num_targets = 6;     // the first 6 cases are the target workloads
+    real         norm_lat;            // cycles / (M*K*N) of one case
+    real         sum_lat     = 0.0;   // sum over the target workloads
 
     $display("");
-    $display("==================================================================");
+    $display("==============================================================================");
     $display(" RESULTS  (array %0dx%0dx%0d, ports A %0d (%0d + %0d) + B %0d + C %0d bits)",
              ArrayHeight, ArrayWidth, ArrayDepth, APortWidth, ALoWidth, AHiWidth,
              BPortWidth, CPortWidth);
-    $display("------------------------------------------------------------------");
-    $display(" %s | %4s %4s %4s | %8s | %12s | %s",
-             pad("Case", 8), "M", "K", "N", "Cycles", "Energy", "Check");
-    $display("------------------------------------------------------------------");
+    $display("------------------------------------------------------------------------------");
+    $display(" %s | %4s %4s %4s | %8s | %12s | %10s | %s",
+             pad("Case", 80), "M", "K", "N", "Cycles", "Energy", "Norm. lat", "Check");
+    $display("------------------------------------------------------------------------------");
     foreach (test_cases[c]) begin
-      $display(" %s | %4d %4d %4d | %8d | %12.0f | %s",
-               pad(test_cases[c].name, 8), test_cases[c].M, test_cases[c].K,
-               test_cases[c].N, case_cycles[c], case_energy[c],
+      // Normalized latency: cycles per MAC operation (M*K*N MACs), in reals so
+      // the division is not an integer division and M*K*N cannot overflow
+      norm_lat = real'(case_cycles[c]) /
+                 (real'(test_cases[c].M) * real'(test_cases[c].K) * real'(test_cases[c].N));
+      if (c < num_targets) sum_lat += norm_lat;
+
+      $display(" %s | %4d %4d %4d | %8d | %12.0f | %10.6f | %s",
+               pad(test_cases[c].name, 80), test_cases[c].M, test_cases[c].K,
+               test_cases[c].N, case_cycles[c], case_energy[c], norm_lat,
                (case_errors[c] == 0) ? "PASS" : "FAIL");
       if (case_errors[c] != 0) num_failed++;
     end
-    $display("------------------------------------------------------------------");
+    $display("------------------------------------------------------------------------------");
     $display(" Area: %0.0f area units", metrics_pkg::area);
-    $display("==================================================================");
+    $display(" Avg normalized latency (first %0d cases = target workloads): %0.6f",
+             num_targets, sum_lat / num_targets);
+    $display("==============================================================================");
     $display("");
 
     if (num_failed != 0) begin
