@@ -80,7 +80,6 @@ questasim-run: questasim_cov.do
 	@echo 'Running Questasim simulation w/ Command Line Interface'
 	vsim -c -do questasim_cov.do
 	vcover report -html -output $(COV_HTML) -details -source $(COV_DB)
-	vcover report -details $(COV_DB) > $(COV_TXT)
 	@echo 'Coverage report: $(COV_HTML)/index.html and $(COV_TXT)'
 
 questasim-run-gui: questasim.do
