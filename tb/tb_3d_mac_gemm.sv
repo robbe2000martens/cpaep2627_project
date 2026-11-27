@@ -70,7 +70,7 @@ module tb_3d_mac_gemm;
     bit          reset_mid_run;  // first cut the run short with resets (reset_during_run)
   } test_case_t;
 
-  localparam int unsigned NumCases   = 15;
+  localparam int unsigned NumCases   = 16;
 
   test_case_t test_cases [NumCases] = '{
     //  name        M   K   N  reset_mid_run
@@ -88,7 +88,8 @@ module tb_3d_mac_gemm;
     {"GeMM, max N = 4095: 512 col tiles of 1 row, last tile 7 cols",                1,    1,    4095, 0},
     {"GeMM, max M = 4095: 64 row tiles, last 63 rows; last col tile 6 cols",        4095, 1,    14,   0},
     {"GeMM, whole workload is one tile with one k-step (Idle -> Finish)",           5,    1,    3,    0},
-    {"GeMM, reset mid-run twice (during the k-steps, before the drain), then full", 64,   64,   16,   1}
+    {"GeMM, reset mid-run twice (during the k-steps, before the drain), then full", 64,   64,   16,   1},
+    {"GeMM, K = 0 so C=0 so must fail", 64,   0,    16,   0}
   };
 
   // Per-case results, printed in the summary at the end

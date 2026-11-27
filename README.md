@@ -5,6 +5,8 @@
 A parametrized SystemVerilog accelerator for GeMM (`C = A × B`) and GeMV (`y = A x`), built from the 1-MAC baseline.
 The final design is a **64 × 8 output-stationary array of 512 MACs** with broadcast operands, a reconfigured GeMV mode, and an SRAM port split of **A 768 b (A_lo 512 + A_hi 256) + B 64 b + C 192 b = 1024 b**.
 
+Average normalized latency over the six target workloads: **0.006931 cycles per MAC** (144× lower than the 1-MAC baseline), area **2048** units.
+
 ---
 
 ## Submission contents
@@ -14,7 +16,7 @@ The final design is a **64 × 8 output-stationary array of 512 MACs** with broad
 | `cpaep_2627_report_jacobs_martens.pdf` | Project report (Q1–Q4) |
 | `cpaep_2627_genai_form_jacobs_martens.pdf` | GenAI disclosure form |
 | `README.md` | This file |
-| everything else | The repository: RTL, testbenches, filelists, Makefile |
+| everything else | The repository: RTL, testbenches, filelists, Makefile, results |
 
 ---
 
@@ -32,47 +34,43 @@ vsim -help        # prints the help text if the setup worked
 
 ## Running the design
 
-### Main testbench (all workloads, one simulation)
+### Main testbench, without GUI (results + coverage report)
 
 ```bash
 make clean
 make TEST_MODULE=tb_3d_mac_gemm questasim-run
 ```
 
-This compiles the files in `flists/tb_3d_mac_gemm.flist` and runs `tb/tb_3d_mac_gemm.sv`. The testbench:
+This compiles the files in `flists/tb_3d_mac_gemm.flist`, runs `tb/tb_3d_mac_gemm.sv` in the command-line simulator, and then writes the coverage reports:
 
-1. checks the design constraints at start-up (≤ 512 MACs, SRAM ports ≤ 1024 bits, a valid A word) and stops with `$fatal` if one is broken,
-2. runs the six target workloads, followed by the extra edge cases, **in one simulation without resetting the DUT**,
-3. per case: fills A and B with random int8 values, packs them into the SRAM words, fills SRAM C with `X`, runs the accelerator, unpacks C and compares it with the golden model,
-4. prints a summary table with cycles, energy and PASS/FAIL per case, and the total area.
+| Output | Content |
+|---|---|
+| terminal / `transcript` | per-case log and the final results table |
+| `cov_tb_3d_mac_gemm.ucdb` | Questa coverage database |
+| `covhtmlreport/index.html` | HTML coverage report (open in a browser) |
+| `coverage_tb_3d_mac_gemm.txt` | the same coverage details as text |
 
-It ends with `All N cases passed!`, or `$fatal` with the number of failed cases.
+The coverage types collected are branch, condition, expression, statement, FSM and toggle (`+cover=bcesft`).
 
-**Expected result for the six target workloads** (energy changes slightly with the random data; cycles do not):
+### Other random data (seed)
 
+The random matrices come from `$urandom`. The seed defaults to 0; choose another one with `SEED`:
+
+```bash
+make clean
+make TEST_MODULE=tb_3d_mac_gemm SEED=42 questasim-run
+make TEST_MODULE=tb_3d_mac_gemm SEED=random questasim-run   # Questa picks one and prints it
 ```
- Case     |    M    K    N |   Cycles |       Energy | Check
- GeMM 1   |   64   64   32 |      599 |       950080 | PASS
- GeMM 2   |   64  128   32 |      855 |      1768446 | PASS
- GeMM 3   |   64  576   32 |     2647 |      7496223 | PASS
- GeMV 1   | 1536  576    1 |     9231 |     18971714 | PASS
- GeMV 2   | 3072 1024    1 |    32783 |     67280632 | PASS
- GeMV 3   | 2816 2048    1 |    61445 |    124397426 | PASS
- Area: 2048 area units
-```
 
-Average normalized latency (cycles / (M·K·N), averaged over the six workloads): **0.00693**.
+The cycle counts do not depend on the data; the energy changes slightly.
 
-### With the GUI (waveforms and coverage)
+### With the GUI (waveforms)
 
 ```bash
 make TEST_MODULE=tb_3d_mac_gemm questasim-run-gui
 ```
 
-When the simulation ends and Questasim asks whether to finish, choose **No**, otherwise the GUI closes.
-
-- **Waveforms:** select an instance (e.g. `tb_3d_mac_gemm/i_dut`), select its signals, *Add Wave*, then `Ctrl+F` to zoom to the full run.
-- **Coverage report:** *Tools → Coverage Report → HTML*, choose *Source Code* and *All Coverage Types*, then *OK*. The report is written to `covhtmlreport/index.html`. Coverage collection is already enabled in the Makefile (`vlog +cover`, `vsim -coverage`).
+When the simulation ends and Questasim asks whether to finish, choose **No**, otherwise the GUI closes. All signals are added to the wave window. The coverage report can also be made here: *Tools → Coverage Report → HTML*.
 
 ### Unit tests (from the baseline)
 
@@ -86,10 +84,63 @@ make TEST_MODULE=tb_one_mac_gemm       questasim-run   # the original 1-MAC desi
 ### Clean up
 
 ```bash
-make clean        # removes work/, questasim.do, transcripts, waveforms and coverage reports
+make clean   # removes work/, the .do scripts, transcript, waveforms, coverage database and reports
 ```
 
-Run `make clean` after changing the Makefile: `questasim.do` is only regenerated when the filelist changes.
+`make clean` also deletes `covhtmlreport/`: copy it elsewhere first if you want to keep a report.
+
+---
+
+## What the testbench does
+
+`tb/tb_3d_mac_gemm.sv`:
+
+1. **Checks the design constraints at start-up** (≤ 512 MACs, SRAM ports ≤ 1024 bits, a valid A word) and stops with `$fatal` if one is broken.
+2. **Runs 15 test cases in one simulation**, without resetting the DUT between cases.
+3. **For each case:**
+   - fills A and B with random int8 values and packs them into the SRAM words,
+   - fills SRAM C with `X`, so a missing write fails the check,
+   - runs the accelerator and counts its cycles and energy,
+   - unpacks C and compares it with the golden model.
+4. **Checks during the run:**
+   - an `$error` if SRAM A_hi is read for a tile that has no rows in it, which would cost energy without changing the result,
+   - two `$error`s in the controller for the GeMV tile overlap. These checks are excluded from code coverage, because their conditions can only be fully covered when an error fires.
+5. **Prints a results table** with M, K, N, cycles, energy, **normalized latency** (cycles / (M·K·N)) and PASS/FAIL per case, then the total area and the **average normalized latency of the six target workloads**.
+6. Ends with `All 15 cases passed!`, or `$fatal` with the number of failed cases.
+
+### Test cases
+
+| # | Case | M | K | N | Purpose |
+|---|---|---|---|---|---|
+| 1–3 | GeMM WL1–WL3 | 64 | 64 / 128 / 576 | 32 | target workloads |
+| 4–6 | GeMV WL1–WL3 | 1536 / 3072 / 2816 | 576 / 1024 / 2048 | 1 | target workloads |
+| 7 | GeMM, 1 k-step per tile | 70 | 1 | 9 | partial row tile (6 rows) and column tile (1 column) |
+| 8 | GeMM, max K | 1 | 4095 | 2 | one tile of 4095 k-steps |
+| 9 | GeMV, tightest overlap | 193 | 17 | 1 | Kt = drain words + 1; 3 tiles, PE bank 0 reused, last tile 1 row |
+| 10 | GeMV, no overlap | 166 | 16 | 1 | Kt = drain words: tiles one by one; last tile reads A_hi |
+| 11 | GeMM, N = 4088 | 1 | 1 | 4088 | 511 column tiles, every bit of the tile counter set |
+| 12 | GeMM, max N | 1 | 1 | 4095 | 512 column tiles, last tile 7 columns |
+| 13 | GeMM, max M | 4095 | 1 | 14 | 64 row tiles, last 63 rows; last column tile 6 columns |
+| 14 | GeMM, one tile, one k-step | 5 | 1 | 3 | whole workload in one tile (Idle → Finish) |
+| 15 | GeMM, reset mid-run | 64 | 64 | 16 | reset twice during a run, then a full run must still be correct |
+
+The six target workloads run first, so their random data (and energy) do not depend on the edge cases. Case 15 is the only one that resets the DUT, on purpose.
+
+### Expected results for the target workloads
+
+Cycles and normalized latency (energy changes slightly with the seed):
+
+| Case | M | K | N | Cycles | Norm. latency |
+|---|---|---|---|---|---|
+| GeMM WL1 | 64 | 64 | 32 | 599 | 0.004570 |
+| GeMM WL2 | 64 | 128 | 32 | 855 | 0.003262 |
+| GeMM WL3 | 64 | 576 | 32 | 2647 | 0.002244 |
+| GeMV WL1 | 1536 | 576 | 1 | 9231 | 0.010434 |
+| GeMV WL2 | 3072 | 1024 | 1 | 32783 | 0.010422 |
+| GeMV WL3 | 2816 | 2048 | 1 | 61445 | 0.010654 |
+| **Average** | | | | | **0.006931** |
+
+Area: 2048 units (512 MACs × 3 + 512 accumulator registers × 1).
 
 ---
 
@@ -98,24 +149,28 @@ Run `make clean` after changing the Makefile: `questasim.do` is only regenerated
 ```
 rtl/
   common/
-    ceiling_counter.sv          loop counter (baseline)
-    metrics_pkg.sv              shared area / energy counters (baseline)
-    single_port_memory.sv       SRAM model, unchanged (baseline)
+    ceiling_counter.sv            loop counter (baseline)
+    metrics_pkg.sv                shared area / energy counters (baseline)
+    single_port_memory.sv         SRAM model, unchanged (baseline)
   gemm/
-    gemm_accelerator_new_top.sv NEW: top level, 64x8x1 PE grid, A/B routing, GeMV mapping, drain mux
-    gemm_controller_new.sv      NEW: tile counters, read FSM, drain FSM, GeMV PE-bank overlap
-    general_mac_pe.sv           MAC PE with area/energy hooks (baseline, reused)
-    gemm_accelerator_top.sv     1-MAC baseline (kept for reference)
-    gemm_controller.sv          1-MAC baseline controller (kept for reference)
+    gemm_accelerator_new_top.sv   NEW: top level: 64x8x1 PE grid, A/B routing, GeMV mapping, drain mux
+    gemm_controller_new.sv        NEW: tile counters, read FSM, drain FSM, GeMV PE-bank overlap
+    general_mac_pe.sv             MAC PE with area/energy hooks (baseline, reused)
+    gemm_accelerator_top.sv       1-MAC baseline (kept for reference)
+    gemm_controller.sv            1-MAC baseline controller (kept for reference)
 tb/
-  tb_3d_mac_gemm.sv             NEW: main testbench (packing, golden model, checks, summary)
-  tb_one_mac_gemm.sv            baseline testbench
+  tb_3d_mac_gemm.sv               NEW: main testbench (packing, golden model, checks, results table)
+  tb_one_mac_gemm.sv              baseline testbench
   tb_mac_pe.sv, tb_ceiling_counter.sv, tb_single_port_memory.sv   unit tests (baseline)
 flists/
-  tb_3d_mac_gemm.flist          NEW: files for the main testbench
-includes/                       shared testbench tasks and golden model (baseline)
-docs/solution/results.txt       results of all design points we simulated (see below)
-Makefile, questa_setup.sh       build and simulator setup (baseline)
+  tb_3d_mac_gemm.flist            NEW: files of the main testbench
+includes/                         shared testbench tasks and golden model (baseline)
+docs/solution/
+  results.txt                     simulation results of every design point we tried
+  results_normalized.txt          the same, with MACs and normalized latency per case
+  cpaep_results.xlsx              the same in a spreadsheet, with a summary and ranking per design point
+Makefile                          Questasim (with coverage and seed) and Verilator targets
+questa_setup.sh                   loads Questasim on the ESAT machines (baseline)
 ```
 
 ---
@@ -125,21 +180,18 @@ Makefile, questa_setup.sh       build and simulator setup (baseline)
 | | GeMM (N > 1) | GeMV (N = 1) |
 |---|---|---|
 | Tile | 64 × 8 outputs of C, one per PE | 96 rows of y |
-| Per cycle | A_lo: 64 int8 (one column slice of A), broadcast along the PE rows; B: 8 int8 (one row slice of B), broadcast down the PE columns | A_lo + A_hi: 96 int8 rows of A, one per PE; x in lane 0 of B, broadcast |
-| PEs used | all 512 | 96, in one of two PE banks (column 0 + top half of column 1, or bottom half of column 1 + column 2) |
-| Drain | 86 words of 6 int32 through the 86:1 drain mux; the array waits | 16 words; overlapped with the next tile in the other PE bank |
+| Per cycle | A_lo: 64 int8 (one column slice of A), broadcast along the PE rows; B: 8 int8 (one row slice of B), broadcast down the PE columns | A_lo + A_hi: 96 int8 (rows of A), one per PE; x in lane 0 of B, broadcast |
+| PEs used | all 512 | 96, in one of two PE banks: column 0 + top half of column 1, or bottom half of column 1 + column 2 |
+| Drain | 86 words of 6 int32 through the drain mux; the array waits | 16 words; overlapped with the next tile in the other PE bank |
 
-The mode is chosen by the controller from the workload size (`N == 1` means GeMV). See the report (Q1, Q2) for the block diagram, loop nests and memory layout.
+The controller picks the mode from the workload size (`N == 1` means GeMV). The report (Q1, Q2) has the block diagram, the loop nests and the memory layout.
 
 **Memory layout** (element 0 in the least significant bits):
-
-- **SRAM A**, address `mt·Kt + kt`: one k-step of one tile. Row `r` of the tile sits at bits `[8r +: 8]`. A_lo holds rows 0–63, A_hi rows 64–95 at the same address. A GeMM only reads A_lo.
+- **SRAM A**, address `mt·Kt + kt`: one k-step of one tile; row `r` of the tile at bits `[8r +: 8]`. A_lo holds rows 0–63 and A_hi rows 64–95, at the same address. A GeMM only reads A_lo.
 - **SRAM B**, address `nt·Kt + kt`: `B[k][nt·8 + n]` at bits `[8n +: 8]`. In a GeMV, `x[k]` is in lane 0.
-- **SRAM C**, address = running count of written words: outputs in column-major order within a tile, 6 int32 per word.
+- **SRAM C**, address = running count of written words: outputs column-major within a tile, 6 int32 per word.
 
-Other features:
-- **Operand isolation:** idle PEs get constant zero inputs, so they add no switching energy.
-- **Self-checks:** the controller contains `$error` checks for the GeMV overlap, and the testbench checks that A_hi is only read when needed.
+**Operand isolation:** idle PEs get constant zero inputs, so they add no switching energy.
 
 ---
 
@@ -156,13 +208,11 @@ The array shape and port widths are parameters at the top of `tb/tb_3d_mac_gemm.
 | `BPortWidth` | 8·W·D | SRAM B word, one k-step |
 | `CPortWidth` | rest of 1024 | SRAM C word, a multiple of 32 bits |
 
-The start-up checks stop the simulation if a combination breaks the budget. `docs/solution/results.txt` lists the results of the shapes we simulated: 1×1×1, 2×1×1, 1×2×1, 1×1×2, 2×2×2, 32×16×1, 32×2×2 and the 64×8×1 variants.
-
-To run with different random data, add a seed to the `vsim` flags in the Makefile, e.g. `QST_FLAGS += -sv_seed 42`, then `make clean` and run again.
+The start-up checks stop the simulation if a combination breaks the budget. `docs/solution/` lists the results of the shapes we simulated (1×1×1, 2×1×1, 1×2×1, 1×1×2, 2×2×2, 32×16×1, 32×2×2 and the 64×8×1 variants).
 
 ---
 
 ## Notes
 
-- The reference simulator is **Questasim**. Verilator was not verified for `tb_3d_mac_gemm`.
-- The testbench allocates large arrays (`DataDepth = 6,000,000`) for the biggest workload, GeMV 3 (A = 2816 × 2048), so the simulation needs some memory and time.
+- The reference simulator is **Questasim**. The Verilator target (`make TEST_MODULE=... all`) comes from the baseline; it was not verified for `tb_3d_mac_gemm`.
+- The testbench allocates large arrays (`DataDepth = 6,000,000`) for the biggest workload, GeMV WL3 (A = 2816 × 2048), so the simulation needs some memory and time.
