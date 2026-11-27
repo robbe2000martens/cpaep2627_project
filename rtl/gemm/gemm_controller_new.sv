@@ -436,7 +436,10 @@ module gemm_controller_new #(
   //   under a running drain)
   // - k-step data never reaches a PE bank that still has words to drain
   //   (its accumulators would change before they are written out)
+  // Excluded from code coverage: their conditions are only fully covered
+  // when an error fires, which no passing test can do.
   //-----------------------
+  // coverage off
   always @(posedge clk_i) begin
     if (rst_ni && k_wrap && !(drain_q == DrainIdle || drain_last))
       $error("%m: tile %0d is done while the previous tile still drains", mt_o);
@@ -444,5 +447,6 @@ module gemm_controller_new #(
         pe_bank_q == drain_bank_q)
       $error("%m: k-step data reaches PE bank %0d while it drains", pe_bank_q);
   end
+  // coverage on
 
 endmodule

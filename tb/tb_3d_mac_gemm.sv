@@ -67,18 +67,28 @@ module tb_3d_mac_gemm;
     int unsigned M;
     int unsigned K;
     int unsigned N;
+    bit          reset_mid_run;  // first cut the run short with resets (reset_during_run)
   } test_case_t;
 
-  localparam int unsigned NumCases   = 6;
+  localparam int unsigned NumCases   = 15;
 
   test_case_t test_cases [NumCases] = '{
-    //  name        M   K   N
-    {"GeMM WL1",   64, 64, 32},
-    {"GeMM WL2",   64, 128, 32},
-    {"GeMM WL3",   64, 576, 32},
-    {"GeMV WL1",   1536, 576, 1},
-    {"GeMV WL2",   3072, 1024, 1},
-    {"GeMV WL3",   2816, 2048, 1}
+    //  name        M   K   N  reset_mid_run
+    {"GeMM WL1",   64, 64, 32, 0},
+    {"GeMM WL2",   64, 128, 32, 0},
+    {"GeMM WL3",   64, 576, 32, 0},
+    {"GeMV WL1",   1536, 576, 1, 0},
+    {"GeMV WL2",   3072, 1024, 1, 0},
+    {"GeMV WL3",   2816, 2048, 1, 0},
+    {"GeMM, 1 k-step per tile: partial row tile (6 rows), partial col tile (1 col)", 70,   1,    9,    0},
+    {"GeMM, max K = 4095: one tile of 4095 k-steps",                                1,    4095, 2,    0},
+    {"GeMV, overlap with least slack (Kt = GemvWords+1): 3 tiles, last has 1 row",  193,  17,   1,    0},
+    {"GeMV, no overlap (Kt = GemvWords): tiles one by one, last tile reads A_hi",   166,  16,   1,    0},
+    {"GeMM, N = 4088: 511 col tiles of 1 row, every bit of Nt[8:0] set",            1,    1,    4088, 0},
+    {"GeMM, max N = 4095: 512 col tiles of 1 row, last tile 7 cols",                1,    1,    4095, 0},
+    {"GeMM, max M = 4095: 64 row tiles, last 63 rows; last col tile 6 cols",        4095, 1,    14,   0},
+    {"GeMM, whole workload is one tile with one k-step (Idle -> Finish)",           5,    1,    3,    0},
+    {"GeMM, reset mid-run twice (during the k-steps, before the drain), then full", 64,   64,   16,   1}
   };
 
   // Per-case results, printed in the summary at the end
@@ -352,6 +362,43 @@ module tb_3d_mac_gemm;
   endtask
 
   //---------------------------
+  // Reset in the middle of a run (cases with reset_mid_run): the workload
+  // is started and cut short by a reset twice, then start_and_wait_gemm
+  // runs it in full and the result is checked as for any case:
+  //   1. halfway through the k-steps of the first tile (read side: Compute)
+  //   2. in the first cycle without a k-step after them, while the read
+  //      side holds and the tile waits for its last k-step to be
+  //      accumulated (Hold and DrainWait). Needs tiles that run one by
+  //      one: a GeMM, or a GeMV with Kt <= GemvWords
+  // Both resets come before the first SRAM C write, so SRAM C is still
+  // poisoned: the full run must write every word itself, starting from
+  // the counters and accumulators that the reset cleared.
+  //---------------------------
+  task automatic pulse_start();
+    clk_delay(1);
+    start = 1'b1;
+    clk_delay(1);
+    start = 1'b0;
+  endtask
+
+  task automatic pulse_reset();
+    rst_ni = 1'b0;
+    clk_delay(2);
+    rst_ni = 1'b1;
+    clk_delay(1);
+  endtask
+
+  task automatic reset_during_run();
+    pulse_start();
+    clk_delay(ceil_div(K_i, ArrayDepth) / 2);
+    pulse_reset();
+
+    pulse_start();
+    while (sram_b_re) clk_delay(1);
+    pulse_reset();
+  endtask
+
+  //---------------------------
   // Test control
   //---------------------------
   initial begin
@@ -389,6 +436,8 @@ module tb_3d_mac_gemm;
       gemm_golden(M_i, K_i, N_i, A_matrix, B_matrix, G_memory);
 
       clk_delay(1);
+
+      if (test_cases[c].reset_mid_run) reset_during_run();
 
       metrics_pkg::energy = 0;
       start_and_wait_gemm(case_cycles[c]);
